@@ -1,6 +1,6 @@
-diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/debug.c ./b/drivers/net/wireless/ath/wcn36xx/debug.c
---- ./a/drivers/net/wireless/ath/wcn36xx/debug.c	2022-12-05 20:37:37.260165100 +0800
-+++ ./b/drivers/net/wireless/ath/wcn36xx/debug.c	2022-12-05 20:37:03.850412300 +0800
+diff -Nur a/drivers/net/wireless/ath/wcn36xx/debug.c b/drivers/net/wireless/ath/wcn36xx/debug.c
+--- a/drivers/net/wireless/ath/wcn36xx/debug.c	2022-12-05 20:37:37.260165100 +0800
++++ b/drivers/net/wireless/ath/wcn36xx/debug.c	2022-12-05 20:37:03.850412300 +0800
 @@ -21,6 +21,7 @@
  #include "wcn36xx.h"
  #include "debug.h"
@@ -70,9 +70,9 @@ diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/debug.c ./b/drivers/net/wireless/
  }
  
  void wcn36xx_debugfs_exit(struct wcn36xx *wcn)
-diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/debug.h ./b/drivers/net/wireless/ath/wcn36xx/debug.h
---- ./a/drivers/net/wireless/ath/wcn36xx/debug.h	2022-12-05 20:37:36.959070100 +0800
-+++ ./b/drivers/net/wireless/ath/wcn36xx/debug.h	2022-12-05 20:37:03.906378300 +0800
+diff -Nur a/drivers/net/wireless/ath/wcn36xx/debug.h b/drivers/net/wireless/ath/wcn36xx/debug.h
+--- a/drivers/net/wireless/ath/wcn36xx/debug.h	2022-12-05 20:37:36.959070100 +0800
++++ b/drivers/net/wireless/ath/wcn36xx/debug.h	2022-12-05 20:37:03.906378300 +0800
 @@ -31,6 +31,7 @@
  	struct dentry *rootdir;
  	struct wcn36xx_dfs_file file_bmps_switcher;
@@ -81,9 +81,9 @@ diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/debug.h ./b/drivers/net/wireless/
  };
  
  void wcn36xx_debugfs_init(struct wcn36xx *wcn);
-diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/dxe.c ./b/drivers/net/wireless/ath/wcn36xx/dxe.c
---- ./a/drivers/net/wireless/ath/wcn36xx/dxe.c	2022-12-05 20:37:37.226184500 +0800
-+++ ./b/drivers/net/wireless/ath/wcn36xx/dxe.c	2022-12-05 20:37:03.814550000 +0800
+diff -Nur a/drivers/net/wireless/ath/wcn36xx/dxe.c b/drivers/net/wireless/ath/wcn36xx/dxe.c
+--- a/drivers/net/wireless/ath/wcn36xx/dxe.c	2022-12-05 20:37:37.226184500 +0800
++++ b/drivers/net/wireless/ath/wcn36xx/dxe.c	2022-12-05 20:37:03.814550000 +0800
 @@ -272,6 +272,21 @@
  	return 0;
  }
@@ -361,9 +361,9 @@ diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/dxe.c ./b/drivers/net/wireless/at
 +	wcn36xx_dxe_deinit_descs(wcn->dev, &wcn->dxe_rx_l_ch);
 +	wcn36xx_dxe_deinit_descs(wcn->dev, &wcn->dxe_rx_h_ch);
  }
-diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/dxe.h ./b/drivers/net/wireless/ath/wcn36xx/dxe.h
---- ./a/drivers/net/wireless/ath/wcn36xx/dxe.h	2022-12-05 20:37:37.209193900 +0800
-+++ ./b/drivers/net/wireless/ath/wcn36xx/dxe.h	2022-12-05 20:37:03.869928400 +0800
+diff -Nur a/drivers/net/wireless/ath/wcn36xx/dxe.h b/drivers/net/wireless/ath/wcn36xx/dxe.h
+--- a/drivers/net/wireless/ath/wcn36xx/dxe.h	2022-12-05 20:37:37.209193900 +0800
++++ b/drivers/net/wireless/ath/wcn36xx/dxe.h	2022-12-05 20:37:03.869928400 +0800
 @@ -466,5 +466,6 @@
  			 struct wcn36xx_tx_bd *bd,
  			 struct sk_buff *skb,
@@ -371,9 +371,9 @@ diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/dxe.h ./b/drivers/net/wireless/at
 +int wcn36xx_dxe_tx_flush(struct wcn36xx *wcn);
  void wcn36xx_dxe_tx_ack_ind(struct wcn36xx *wcn, u32 status);
  #endif	/* _DXE_H_ */
-diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/firmware.c ./b/drivers/net/wireless/ath/wcn36xx/firmware.c
---- ./a/drivers/net/wireless/ath/wcn36xx/firmware.c	1970-01-01 08:00:00.000000000 +0800
-+++ ./b/drivers/net/wireless/ath/wcn36xx/firmware.c	2022-12-05 20:37:03.978947400 +0800
+diff -Nur a/drivers/net/wireless/ath/wcn36xx/firmware.c b/drivers/net/wireless/ath/wcn36xx/firmware.c
+--- a/drivers/net/wireless/ath/wcn36xx/firmware.c	1970-01-01 08:00:00.000000000 +0800
++++ b/drivers/net/wireless/ath/wcn36xx/firmware.c	2022-12-05 20:37:03.978947400 +0800
 @@ -0,0 +1,125 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +
@@ -500,9 +500,9 @@ diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/firmware.c ./b/drivers/net/wirele
 +	bit_idx = cap % 32;
 +	bitmap[arr_idx] &= ~(1 << bit_idx);
 +}
-diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/firmware.h ./b/drivers/net/wireless/ath/wcn36xx/firmware.h
---- ./a/drivers/net/wireless/ath/wcn36xx/firmware.h	1970-01-01 08:00:00.000000000 +0800
-+++ ./b/drivers/net/wireless/ath/wcn36xx/firmware.h	2022-12-05 20:37:03.997308800 +0800
+diff -Nur a/drivers/net/wireless/ath/wcn36xx/firmware.h b/drivers/net/wireless/ath/wcn36xx/firmware.h
+--- a/drivers/net/wireless/ath/wcn36xx/firmware.h	1970-01-01 08:00:00.000000000 +0800
++++ b/drivers/net/wireless/ath/wcn36xx/firmware.h	2022-12-05 20:37:03.997308800 +0800
 @@ -0,0 +1,84 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +
@@ -588,9 +588,9 @@ diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/firmware.h ./b/drivers/net/wirele
 +
 +#endif /* _FIRMWARE_H_ */
 +
-diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/hal.h ./b/drivers/net/wireless/ath/wcn36xx/hal.h
---- ./a/drivers/net/wireless/ath/wcn36xx/hal.h	2022-12-05 20:37:36.982069100 +0800
-+++ ./b/drivers/net/wireless/ath/wcn36xx/hal.h	2022-12-05 20:37:03.775113700 +0800
+diff -Nur a/drivers/net/wireless/ath/wcn36xx/hal.h b/drivers/net/wireless/ath/wcn36xx/hal.h
+--- a/drivers/net/wireless/ath/wcn36xx/hal.h	2022-12-05 20:37:36.982069100 +0800
++++ b/drivers/net/wireless/ath/wcn36xx/hal.h	2022-12-05 20:37:03.775113700 +0800
 @@ -359,6 +359,8 @@
  	WCN36XX_HAL_START_SCAN_OFFLOAD_RSP = 205,
  	WCN36XX_HAL_STOP_SCAN_OFFLOAD_REQ = 206,
@@ -903,9 +903,9 @@ diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/hal.h ./b/drivers/net/wireless/at
  
  struct dhcp_info {
  	/* Indicates the device mode which indicates about the DHCP activity */
-diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/main.c ./b/drivers/net/wireless/ath/wcn36xx/main.c
---- ./a/drivers/net/wireless/ath/wcn36xx/main.c	2022-12-05 20:37:36.999315000 +0800
-+++ ./b/drivers/net/wireless/ath/wcn36xx/main.c	2022-12-05 20:37:03.942100600 +0800
+diff -Nur a/drivers/net/wireless/ath/wcn36xx/main.c b/drivers/net/wireless/ath/wcn36xx/main.c
+--- a/drivers/net/wireless/ath/wcn36xx/main.c	2022-12-05 20:37:36.999315000 +0800
++++ b/drivers/net/wireless/ath/wcn36xx/main.c	2022-12-05 20:37:03.942100600 +0800
 @@ -25,8 +25,10 @@
  #include <linux/rpmsg.h>
  #include <linux/soc/qcom/smem_state.h>
@@ -1824,9 +1824,9 @@ diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/main.c ./b/drivers/net/wireless/a
  	mutex_destroy(&wcn->hal_mutex);
  	ieee80211_free_hw(hw);
  
-diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/Makefile ./b/drivers/net/wireless/ath/wcn36xx/Makefile
---- ./a/drivers/net/wireless/ath/wcn36xx/Makefile	2022-12-05 20:37:37.138234800 +0800
-+++ ./b/drivers/net/wireless/ath/wcn36xx/Makefile	2022-12-05 20:37:04.053322800 +0800
+diff -Nur a/drivers/net/wireless/ath/wcn36xx/Makefile b/drivers/net/wireless/ath/wcn36xx/Makefile
+--- a/drivers/net/wireless/ath/wcn36xx/Makefile	2022-12-05 20:37:37.138234800 +0800
++++ b/drivers/net/wireless/ath/wcn36xx/Makefile	2022-12-05 20:37:04.053322800 +0800
 @@ -5,6 +5,7 @@
                 txrx.o \
                 smd.o \
@@ -1836,9 +1836,9 @@ diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/Makefile ./b/drivers/net/wireless
 +               firmware.o
  
  wcn36xx-$(CONFIG_NL80211_TESTMODE) += testmode.o
-diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/pmc.c ./b/drivers/net/wireless/ath/wcn36xx/pmc.c
---- ./a/drivers/net/wireless/ath/wcn36xx/pmc.c	2022-12-05 20:37:37.086281300 +0800
-+++ ./b/drivers/net/wireless/ath/wcn36xx/pmc.c	2022-12-05 20:37:03.887376800 +0800
+diff -Nur a/drivers/net/wireless/ath/wcn36xx/pmc.c b/drivers/net/wireless/ath/wcn36xx/pmc.c
+--- a/drivers/net/wireless/ath/wcn36xx/pmc.c	2022-12-05 20:37:37.086281300 +0800
++++ b/drivers/net/wireless/ath/wcn36xx/pmc.c	2022-12-05 20:37:03.887376800 +0800
 @@ -18,19 +18,19 @@
  
  #include "wcn36xx.h"
@@ -1875,9 +1875,9 @@ diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/pmc.c ./b/drivers/net/wireless/at
  	}
  	return ret;
  }
-diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/smd.c ./b/drivers/net/wireless/ath/wcn36xx/smd.c
---- ./a/drivers/net/wireless/ath/wcn36xx/smd.c	2022-12-05 20:37:37.191202700 +0800
-+++ ./b/drivers/net/wireless/ath/wcn36xx/smd.c	2022-12-05 20:37:03.833555500 +0800
+diff -Nur a/drivers/net/wireless/ath/wcn36xx/smd.c b/drivers/net/wireless/ath/wcn36xx/smd.c
+--- a/drivers/net/wireless/ath/wcn36xx/smd.c	2022-12-05 20:37:37.191202700 +0800
++++ b/drivers/net/wireless/ath/wcn36xx/smd.c	2022-12-05 20:37:03.833555500 +0800
 @@ -16,11 +16,13 @@
  
  #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -2938,9 +2938,9 @@ diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/smd.c ./b/drivers/net/wireless/at
  		if (!msg_ind) {
  			wcn36xx_err("Run out of memory while handling SMD_EVENT (%d)\n",
  				    msg_header->msg_type);
-diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/smd.h ./b/drivers/net/wireless/ath/wcn36xx/smd.h
---- ./a/drivers/net/wireless/ath/wcn36xx/smd.h	2022-12-05 20:37:37.052296300 +0800
-+++ ./b/drivers/net/wireless/ath/wcn36xx/smd.h	2022-12-05 20:37:03.924112400 +0800
+diff -Nur a/drivers/net/wireless/ath/wcn36xx/smd.h b/drivers/net/wireless/ath/wcn36xx/smd.h
+--- a/drivers/net/wireless/ath/wcn36xx/smd.h	2022-12-05 20:37:37.052296300 +0800
++++ b/drivers/net/wireless/ath/wcn36xx/smd.h	2022-12-05 20:37:03.924112400 +0800
 @@ -70,6 +70,7 @@
  int wcn36xx_smd_start_hw_scan(struct wcn36xx *wcn, struct ieee80211_vif *vif,
  			      struct cfg80211_scan_request *req);
@@ -3000,9 +3000,9 @@ diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/smd.h ./b/drivers/net/wireless/at
 +				  struct ieee80211_vif *vif);
 +
  #endif	/* _SMD_H_ */
-diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/txrx.c ./b/drivers/net/wireless/ath/wcn36xx/txrx.c
---- ./a/drivers/net/wireless/ath/wcn36xx/txrx.c	2022-12-05 20:37:37.033295900 +0800
-+++ ./b/drivers/net/wireless/ath/wcn36xx/txrx.c	2022-12-05 20:37:04.034331500 +0800
+diff -Nur a/drivers/net/wireless/ath/wcn36xx/txrx.c b/drivers/net/wireless/ath/wcn36xx/txrx.c
+--- a/drivers/net/wireless/ath/wcn36xx/txrx.c	2022-12-05 20:37:37.033295900 +0800
++++ b/drivers/net/wireless/ath/wcn36xx/txrx.c	2022-12-05 20:37:04.034331500 +0800
 @@ -16,6 +16,7 @@
  
  #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -3376,9 +3376,9 @@ diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/txrx.c ./b/drivers/net/wireless/a
 +	if (stats->tx_rate_flags & HAL_TX_RATE_VHT80)
 +		info->bw = RATE_INFO_BW_80;
 +}
-diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/txrx.h ./b/drivers/net/wireless/ath/wcn36xx/txrx.h
---- ./a/drivers/net/wireless/ath/wcn36xx/txrx.h	2022-12-05 20:37:37.244174400 +0800
-+++ ./b/drivers/net/wireless/ath/wcn36xx/txrx.h	2022-12-05 20:37:04.072543300 +0800
+diff -Nur a/drivers/net/wireless/ath/wcn36xx/txrx.h b/drivers/net/wireless/ath/wcn36xx/txrx.h
+--- a/drivers/net/wireless/ath/wcn36xx/txrx.h	2022-12-05 20:37:37.244174400 +0800
++++ b/drivers/net/wireless/ath/wcn36xx/txrx.h	2022-12-05 20:37:04.072543300 +0800
 @@ -110,7 +110,8 @@
  	/* 0x44 */
  	u32	exp_seq_num:12;
@@ -3396,9 +3396,9 @@ diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/txrx.h ./b/drivers/net/wireless/a
 +void wcn36xx_process_tx_rate(struct ani_global_class_a_stats_info *stats, struct rate_info *info);
  
  #endif	/* _TXRX_H_ */
-diff -Nur ./a/drivers/net/wireless/ath/wcn36xx/wcn36xx.h ./b/drivers/net/wireless/ath/wcn36xx/wcn36xx.h
---- ./a/drivers/net/wireless/ath/wcn36xx/wcn36xx.h	2022-12-05 20:37:37.173212900 +0800
-+++ ./b/drivers/net/wireless/ath/wcn36xx/wcn36xx.h	2022-12-05 20:37:04.016299500 +0800
+diff -Nur a/drivers/net/wireless/ath/wcn36xx/wcn36xx.h b/drivers/net/wireless/ath/wcn36xx/wcn36xx.h
+--- a/drivers/net/wireless/ath/wcn36xx/wcn36xx.h	2022-12-05 20:37:37.173212900 +0800
++++ b/drivers/net/wireless/ath/wcn36xx/wcn36xx.h	2022-12-05 20:37:04.016299500 +0800
 @@ -18,6 +18,7 @@
  #define _WCN36XX_H_
  
