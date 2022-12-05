@@ -1,0 +1,3500 @@
+diff -Nur ./wcn36xx/debug.c ./wcn36xx_new/debug.c
+--- ./wcn36xx/debug.c	2022-12-05 20:37:37.260165100 +0800
++++ ./wcn36xx_new/debug.c	2022-12-05 20:37:03.850412300 +0800
+@@ -21,6 +21,7 @@
+ #include "wcn36xx.h"
+ #include "debug.h"
+ #include "pmc.h"
++#include "firmware.h"
+ 
+ #ifdef CONFIG_WCN36XX_DEBUGFS
+ 
+@@ -120,7 +121,7 @@
+ 		if (begin == NULL)
+ 			break;
+ 
+-		if (kstrtou32(begin, 0, &arg[i]) != 0)
++		if (kstrtos32(begin, 0, &arg[i]) != 0)
+ 			break;
+ 	}
+ 
+@@ -136,6 +137,42 @@
+ 	.write =       write_file_dump,
+ };
+ 
++static ssize_t read_file_firmware_feature_caps(struct file *file,
++					       char __user *user_buf,
++					       size_t count, loff_t *ppos)
++{
++	struct wcn36xx *wcn = file->private_data;
++	size_t len = 0, buf_len = 2048;
++	char *buf;
++	int i;
++	int ret;
++
++	buf = kzalloc(buf_len, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	mutex_lock(&wcn->hal_mutex);
++	for (i = 0; i < MAX_FEATURE_SUPPORTED; i++) {
++		if (wcn36xx_firmware_get_feat_caps(wcn->fw_feat_caps, i)) {
++			len += scnprintf(buf + len, buf_len - len, "%s\n",
++					 wcn36xx_firmware_get_cap_name(i));
++		}
++		if (len >= buf_len)
++			break;
++	}
++	mutex_unlock(&wcn->hal_mutex);
++
++	ret = simple_read_from_buffer(user_buf, count, ppos, buf, len);
++	kfree(buf);
++
++	return ret;
++}
++
++static const struct file_operations fops_wcn36xx_firmware_feat_caps = {
++	.open = simple_open,
++	.read = read_file_firmware_feature_caps,
++};
++
+ #define ADD_FILE(name, mode, fop, priv_data)		\
+ 	do {							\
+ 		struct dentry *d;				\
+@@ -163,6 +200,8 @@
+ 
+ 	ADD_FILE(bmps_switcher, 0600, &fops_wcn36xx_bmps, wcn);
+ 	ADD_FILE(dump, 0200, &fops_wcn36xx_dump, wcn);
++	ADD_FILE(firmware_feat_caps, 0200,
++		 &fops_wcn36xx_firmware_feat_caps, wcn);
+ }
+ 
+ void wcn36xx_debugfs_exit(struct wcn36xx *wcn)
+diff -Nur ./wcn36xx/debug.h ./wcn36xx_new/debug.h
+--- ./wcn36xx/debug.h	2022-12-05 20:37:36.959070100 +0800
++++ ./wcn36xx_new/debug.h	2022-12-05 20:37:03.906378300 +0800
+@@ -31,6 +31,7 @@
+ 	struct dentry *rootdir;
+ 	struct wcn36xx_dfs_file file_bmps_switcher;
+ 	struct wcn36xx_dfs_file file_dump;
++	struct wcn36xx_dfs_file file_firmware_feat_caps;
+ };
+ 
+ void wcn36xx_debugfs_init(struct wcn36xx *wcn);
+diff -Nur ./wcn36xx/dxe.c ./wcn36xx_new/dxe.c
+--- ./wcn36xx/dxe.c	2022-12-05 20:37:37.226184500 +0800
++++ ./wcn36xx_new/dxe.c	2022-12-05 20:37:03.814550000 +0800
+@@ -272,6 +272,21 @@
+ 	return 0;
+ }
+ 
++static void wcn36xx_dxe_disable_ch_int(struct wcn36xx *wcn, u16 wcn_ch)
++{
++	int reg_data = 0;
++
++	wcn36xx_dxe_read_register(wcn,
++				  WCN36XX_DXE_INT_MASK_REG,
++				  &reg_data);
++
++	reg_data &= ~wcn_ch;
++
++	wcn36xx_dxe_write_register(wcn,
++				   WCN36XX_DXE_INT_MASK_REG,
++				   (int)reg_data);
++}
++
+ static int wcn36xx_dxe_fill_skb(struct device *dev,
+ 				struct wcn36xx_dxe_ctl *ctl,
+ 				gfp_t gfp)
+@@ -403,8 +418,21 @@
+ 			dma_unmap_single(wcn->dev, ctl->desc->src_addr_l,
+ 					 ctl->skb->len, DMA_TO_DEVICE);
+ 			info = IEEE80211_SKB_CB(ctl->skb);
+-			if (!(info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS)) {
+-				/* Keep frame until TX status comes */
++			if (info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS) {
++				if (info->flags & IEEE80211_TX_CTL_NO_ACK) {
++					info->flags |= IEEE80211_TX_STAT_NOACK_TRANSMITTED;
++					ieee80211_tx_status_irqsafe(wcn->hw, ctl->skb);
++				} else {
++					/* Wait for the TX ack indication or timeout... */
++					spin_lock(&wcn->dxe_lock);
++					if (WARN_ON(wcn->tx_ack_skb))
++						ieee80211_free_txskb(wcn->hw, wcn->tx_ack_skb);
++					wcn->tx_ack_skb = ctl->skb; /* Tracking ref */
++					mod_timer(&wcn->tx_ack_timer, jiffies + HZ / 10);
++					spin_unlock(&wcn->dxe_lock);
++				}
++				/* do not free, ownership transferred to mac80211 status cb */
++			} else {
+ 				ieee80211_free_txskb(wcn->hw, ctl->skb);
+ 			}
+ 
+@@ -426,7 +454,6 @@
+ {
+ 	struct wcn36xx *wcn = (struct wcn36xx *)dev;
+ 	int int_src, int_reason;
+-	bool transmitted = false;
+ 
+ 	wcn36xx_dxe_read_register(wcn, WCN36XX_DXE_INT_SRC_RAW_REG, &int_src);
+ 
+@@ -466,7 +493,6 @@
+ 		if (int_reason & (WCN36XX_CH_STAT_INT_DONE_MASK |
+ 				  WCN36XX_CH_STAT_INT_ED_MASK)) {
+ 			reap_tx_dxes(wcn, &wcn->dxe_tx_h_ch);
+-			transmitted = true;
+ 		}
+ 	}
+ 
+@@ -479,7 +505,6 @@
+ 					   WCN36XX_DXE_0_INT_CLR,
+ 					   WCN36XX_INT_MASK_CHAN_TX_L);
+ 
+-
+ 		if (int_reason & WCN36XX_CH_STAT_INT_ERR_MASK ) {
+ 			wcn36xx_dxe_write_register(wcn,
+ 						   WCN36XX_DXE_0_INT_ERR_CLR,
+@@ -507,26 +532,9 @@
+ 		if (int_reason & (WCN36XX_CH_STAT_INT_DONE_MASK |
+ 				  WCN36XX_CH_STAT_INT_ED_MASK)) {
+ 			reap_tx_dxes(wcn, &wcn->dxe_tx_l_ch);
+-			transmitted = true;
+ 		}
+ 	}
+ 
+-	spin_lock(&wcn->dxe_lock);
+-	if (wcn->tx_ack_skb && transmitted) {
+-		struct ieee80211_tx_info *info = IEEE80211_SKB_CB(wcn->tx_ack_skb);
+-
+-		/* TX complete, no need to wait for 802.11 ack indication */
+-		if (info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS &&
+-		    info->flags & IEEE80211_TX_CTL_NO_ACK) {
+-			info->flags |= IEEE80211_TX_STAT_NOACK_TRANSMITTED;
+-			del_timer(&wcn->tx_ack_timer);
+-			ieee80211_tx_status_irqsafe(wcn->hw, wcn->tx_ack_skb);
+-			wcn->tx_ack_skb = NULL;
+-			ieee80211_wake_queues(wcn->hw);
+-		}
+-	}
+-	spin_unlock(&wcn->dxe_lock);
+-
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -613,6 +621,10 @@
+ 	dxe = ctl->desc;
+ 
+ 	while (!(READ_ONCE(dxe->ctrl) & WCN36xx_DXE_CTRL_VLD)) {
++		/* do not read until we own DMA descriptor */
++		dma_rmb();
++
++		/* read/modify DMA descriptor */
+ 		skb = ctl->skb;
+ 		dma_addr = dxe->dst_addr_l;
+ 		ret = wcn36xx_dxe_fill_skb(wcn->dev, ctl, GFP_ATOMIC);
+@@ -623,9 +635,15 @@
+ 			dma_unmap_single(wcn->dev, dma_addr, WCN36XX_PKT_SIZE,
+ 					DMA_FROM_DEVICE);
+ 			wcn36xx_rx_skb(wcn, skb);
+-		} /* else keep old skb not submitted and use it for rx DMA */
++		}
++		/* else keep old skb not submitted and reuse it for rx DMA
++		 * (dropping the packet that it contained)
++		 */
+ 
++		/* flush descriptor changes before re-marking as valid */
++		dma_wmb();
+ 		dxe->ctrl = ctrl;
++
+ 		ctl = ctl->next;
+ 		dxe = ctl->desc;
+ 	}
+@@ -800,7 +818,7 @@
+ 			 (char *)ctl_skb->skb->data, ctl_skb->skb->len);
+ 
+ 	/* Move the head of the ring to the next empty descriptor */
+-	 ch->head_blk_ctl = ctl_skb->next;
++	ch->head_blk_ctl = ctl_skb->next;
+ 
+ 	/* Commit all previous writes and set descriptors to VALID */
+ 	wmb();
+@@ -831,6 +849,53 @@
+ 	return ret;
+ }
+ 
++static bool _wcn36xx_dxe_tx_channel_is_empty(struct wcn36xx_dxe_ch *ch)
++{
++	unsigned long flags;
++	struct wcn36xx_dxe_ctl *ctl_bd_start, *ctl_skb_start;
++	struct wcn36xx_dxe_ctl *ctl_bd, *ctl_skb;
++	bool ret = true;
++
++	spin_lock_irqsave(&ch->lock, flags);
++
++	/* Loop through ring buffer looking for nonempty entries. */
++	ctl_bd_start = ch->head_blk_ctl;
++	ctl_bd = ctl_bd_start;
++	ctl_skb_start = ctl_bd_start->next;
++	ctl_skb = ctl_skb_start;
++	do {
++		if (ctl_skb->skb) {
++			ret = false;
++			goto unlock;
++		}
++		ctl_bd = ctl_skb->next;
++		ctl_skb = ctl_bd->next;
++	} while (ctl_skb != ctl_skb_start);
++
++unlock:
++	spin_unlock_irqrestore(&ch->lock, flags);
++	return ret;
++}
++
++int wcn36xx_dxe_tx_flush(struct wcn36xx *wcn)
++{
++	int i = 0;
++
++	/* Called with mac80211 queues stopped. Wait for empty HW queues. */
++	do {
++		if (_wcn36xx_dxe_tx_channel_is_empty(&wcn->dxe_tx_l_ch) &&
++		    _wcn36xx_dxe_tx_channel_is_empty(&wcn->dxe_tx_h_ch)) {
++			return 0;
++		}
++		/* This ieee80211_ops callback is specifically allowed to
++		 * sleep.
++		 */
++		usleep_range(1000, 1100);
++	} while (++i < 100);
++
++	return -EBUSY;
++}
++
+ int wcn36xx_dxe_init(struct wcn36xx *wcn)
+ {
+ 	int reg_data = 0, ret;
+@@ -866,7 +931,6 @@
+ 		WCN36XX_DXE_WQ_TX_L);
+ 
+ 	wcn36xx_dxe_read_register(wcn, WCN36XX_DXE_REG_CH_EN, &reg_data);
+-	wcn36xx_dxe_enable_ch_int(wcn, WCN36XX_INT_MASK_CHAN_TX_L);
+ 
+ 	/***************************************/
+ 	/* Init descriptors for TX HIGH channel */
+@@ -890,9 +954,6 @@
+ 
+ 	wcn36xx_dxe_read_register(wcn, WCN36XX_DXE_REG_CH_EN, &reg_data);
+ 
+-	/* Enable channel interrupts */
+-	wcn36xx_dxe_enable_ch_int(wcn, WCN36XX_INT_MASK_CHAN_TX_H);
+-
+ 	/***************************************/
+ 	/* Init descriptors for RX LOW channel */
+ 	/***************************************/
+@@ -902,7 +963,6 @@
+ 		goto out_err_rxl_ch;
+ 	}
+ 
+-
+ 	/* For RX we need to preallocated buffers */
+ 	wcn36xx_dxe_ch_alloc_skb(wcn, &wcn->dxe_rx_l_ch);
+ 
+@@ -925,9 +985,6 @@
+ 		WCN36XX_DXE_REG_CTL_RX_L,
+ 		WCN36XX_DXE_CH_DEFAULT_CTL_RX_L);
+ 
+-	/* Enable channel interrupts */
+-	wcn36xx_dxe_enable_ch_int(wcn, WCN36XX_INT_MASK_CHAN_RX_L);
+-
+ 	/***************************************/
+ 	/* Init descriptors for RX HIGH channel */
+ 	/***************************************/
+@@ -959,15 +1016,18 @@
+ 		WCN36XX_DXE_REG_CTL_RX_H,
+ 		WCN36XX_DXE_CH_DEFAULT_CTL_RX_H);
+ 
+-	/* Enable channel interrupts */
+-	wcn36xx_dxe_enable_ch_int(wcn, WCN36XX_INT_MASK_CHAN_RX_H);
+-
+ 	ret = wcn36xx_dxe_request_irqs(wcn);
+ 	if (ret < 0)
+ 		goto out_err_irq;
+ 
+ 	timer_setup(&wcn->tx_ack_timer, wcn36xx_dxe_tx_timer, 0);
+ 
++	/* Enable channel interrupts */
++	wcn36xx_dxe_enable_ch_int(wcn, WCN36XX_INT_MASK_CHAN_TX_L);
++	wcn36xx_dxe_enable_ch_int(wcn, WCN36XX_INT_MASK_CHAN_TX_H);
++	wcn36xx_dxe_enable_ch_int(wcn, WCN36XX_INT_MASK_CHAN_RX_L);
++	wcn36xx_dxe_enable_ch_int(wcn, WCN36XX_INT_MASK_CHAN_RX_H);
++
+ 	return 0;
+ 
+ out_err_irq:
+@@ -984,6 +1044,14 @@
+ 
+ void wcn36xx_dxe_deinit(struct wcn36xx *wcn)
+ {
++	int reg_data = 0;
++
++	/* Disable channel interrupts */
++	wcn36xx_dxe_disable_ch_int(wcn, WCN36XX_INT_MASK_CHAN_RX_H);
++	wcn36xx_dxe_disable_ch_int(wcn, WCN36XX_INT_MASK_CHAN_RX_L);
++	wcn36xx_dxe_disable_ch_int(wcn, WCN36XX_INT_MASK_CHAN_TX_H);
++	wcn36xx_dxe_disable_ch_int(wcn, WCN36XX_INT_MASK_CHAN_TX_L);
++
+ 	free_irq(wcn->tx_irq, wcn);
+ 	free_irq(wcn->rx_irq, wcn);
+ 	del_timer(&wcn->tx_ack_timer);
+@@ -993,6 +1061,15 @@
+ 		wcn->tx_ack_skb = NULL;
+ 	}
+ 
++	/* Put the DXE block into reset before freeing memory */
++	reg_data = WCN36XX_DXE_REG_RESET;
++	wcn36xx_dxe_write_register(wcn, WCN36XX_DXE_REG_CSR_RESET, reg_data);
++
+ 	wcn36xx_dxe_ch_free_skbs(wcn, &wcn->dxe_rx_l_ch);
+ 	wcn36xx_dxe_ch_free_skbs(wcn, &wcn->dxe_rx_h_ch);
++
++	wcn36xx_dxe_deinit_descs(wcn->dev, &wcn->dxe_tx_l_ch);
++	wcn36xx_dxe_deinit_descs(wcn->dev, &wcn->dxe_tx_h_ch);
++	wcn36xx_dxe_deinit_descs(wcn->dev, &wcn->dxe_rx_l_ch);
++	wcn36xx_dxe_deinit_descs(wcn->dev, &wcn->dxe_rx_h_ch);
+ }
+diff -Nur ./wcn36xx/dxe.h ./wcn36xx_new/dxe.h
+--- ./wcn36xx/dxe.h	2022-12-05 20:37:37.209193900 +0800
++++ ./wcn36xx_new/dxe.h	2022-12-05 20:37:03.869928400 +0800
+@@ -466,5 +466,6 @@
+ 			 struct wcn36xx_tx_bd *bd,
+ 			 struct sk_buff *skb,
+ 			 bool is_low);
++int wcn36xx_dxe_tx_flush(struct wcn36xx *wcn);
+ void wcn36xx_dxe_tx_ack_ind(struct wcn36xx *wcn, u32 status);
+ #endif	/* _DXE_H_ */
+diff -Nur ./wcn36xx/firmware.c ./wcn36xx_new/firmware.c
+--- ./wcn36xx/firmware.c	1970-01-01 08:00:00.000000000 +0800
++++ ./wcn36xx_new/firmware.c	2022-12-05 20:37:03.978947400 +0800
+@@ -0,0 +1,125 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include "wcn36xx.h"
++#include "firmware.h"
++
++#define DEFINE(s)[s] = #s
++
++static const char * const wcn36xx_firmware_caps_names[] = {
++	DEFINE(MCC),
++	DEFINE(P2P),
++	DEFINE(DOT11AC),
++	DEFINE(SLM_SESSIONIZATION),
++	DEFINE(DOT11AC_OPMODE),
++	DEFINE(SAP32STA),
++	DEFINE(TDLS),
++	DEFINE(P2P_GO_NOA_DECOUPLE_INIT_SCAN),
++	DEFINE(WLANACTIVE_OFFLOAD),
++	DEFINE(BEACON_OFFLOAD),
++	DEFINE(SCAN_OFFLOAD),
++	DEFINE(ROAM_OFFLOAD),
++	DEFINE(BCN_MISS_OFFLOAD),
++	DEFINE(STA_POWERSAVE),
++	DEFINE(STA_ADVANCED_PWRSAVE),
++	DEFINE(AP_UAPSD),
++	DEFINE(AP_DFS),
++	DEFINE(BLOCKACK),
++	DEFINE(PHY_ERR),
++	DEFINE(BCN_FILTER),
++	DEFINE(RTT),
++	DEFINE(RATECTRL),
++	DEFINE(WOW),
++	DEFINE(WLAN_ROAM_SCAN_OFFLOAD),
++	DEFINE(SPECULATIVE_PS_POLL),
++	DEFINE(SCAN_SCH),
++	DEFINE(IBSS_HEARTBEAT_OFFLOAD),
++	DEFINE(WLAN_SCAN_OFFLOAD),
++	DEFINE(WLAN_PERIODIC_TX_PTRN),
++	DEFINE(ADVANCE_TDLS),
++	DEFINE(BATCH_SCAN),
++	DEFINE(FW_IN_TX_PATH),
++	DEFINE(EXTENDED_NSOFFLOAD_SLOT),
++	DEFINE(CH_SWITCH_V1),
++	DEFINE(HT40_OBSS_SCAN),
++	DEFINE(UPDATE_CHANNEL_LIST),
++	DEFINE(WLAN_MCADDR_FLT),
++	DEFINE(WLAN_CH144),
++	DEFINE(NAN),
++	DEFINE(TDLS_SCAN_COEXISTENCE),
++	DEFINE(LINK_LAYER_STATS_MEAS),
++	DEFINE(MU_MIMO),
++	DEFINE(EXTENDED_SCAN),
++	DEFINE(DYNAMIC_WMM_PS),
++	DEFINE(MAC_SPOOFED_SCAN),
++	DEFINE(BMU_ERROR_GENERIC_RECOVERY),
++	DEFINE(DISA),
++	DEFINE(FW_STATS),
++	DEFINE(WPS_PRBRSP_TMPL),
++	DEFINE(BCN_IE_FLT_DELTA),
++	DEFINE(TDLS_OFF_CHANNEL),
++	DEFINE(RTT3),
++	DEFINE(MGMT_FRAME_LOGGING),
++	DEFINE(ENHANCED_TXBD_COMPLETION),
++	DEFINE(LOGGING_ENHANCEMENT),
++	DEFINE(EXT_SCAN_ENHANCED),
++	DEFINE(MEMORY_DUMP_SUPPORTED),
++	DEFINE(PER_PKT_STATS_SUPPORTED),
++	DEFINE(EXT_LL_STAT),
++	DEFINE(WIFI_CONFIG),
++	DEFINE(ANTENNA_DIVERSITY_SELECTION),
++};
++
++#undef DEFINE
++
++const char *wcn36xx_firmware_get_cap_name(enum wcn36xx_firmware_feat_caps x)
++{
++	if (x >= ARRAY_SIZE(wcn36xx_firmware_caps_names))
++		return "UNKNOWN";
++	return wcn36xx_firmware_caps_names[x];
++}
++
++void wcn36xx_firmware_set_feat_caps(u32 *bitmap,
++				    enum wcn36xx_firmware_feat_caps cap)
++{
++	int arr_idx, bit_idx;
++
++	if (cap < 0 || cap > 127) {
++		wcn36xx_warn("error cap idx %d\n", cap);
++		return;
++	}
++
++	arr_idx = cap / 32;
++	bit_idx = cap % 32;
++	bitmap[arr_idx] |= (1 << bit_idx);
++}
++
++int wcn36xx_firmware_get_feat_caps(u32 *bitmap,
++				   enum wcn36xx_firmware_feat_caps cap)
++{
++	int arr_idx, bit_idx;
++
++	if (cap < 0 || cap > 127) {
++		wcn36xx_warn("error cap idx %d\n", cap);
++		return -EINVAL;
++	}
++
++	arr_idx = cap / 32;
++	bit_idx = cap % 32;
++
++	return (bitmap[arr_idx] & (1 << bit_idx)) ? 1 : 0;
++}
++
++void wcn36xx_firmware_clear_feat_caps(u32 *bitmap,
++				      enum wcn36xx_firmware_feat_caps cap)
++{
++	int arr_idx, bit_idx;
++
++	if (cap < 0 || cap > 127) {
++		wcn36xx_warn("error cap idx %d\n", cap);
++		return;
++	}
++
++	arr_idx = cap / 32;
++	bit_idx = cap % 32;
++	bitmap[arr_idx] &= ~(1 << bit_idx);
++}
+diff -Nur ./wcn36xx/firmware.h ./wcn36xx_new/firmware.h
+--- ./wcn36xx/firmware.h	1970-01-01 08:00:00.000000000 +0800
++++ ./wcn36xx_new/firmware.h	2022-12-05 20:37:03.997308800 +0800
+@@ -0,0 +1,84 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef _FIRMWARE_H_
++#define _FIRMWARE_H_
++
++/* Capability bitmap exchange definitions and macros starts */
++
++enum wcn36xx_firmware_feat_caps {
++	MCC = 0,
++	P2P = 1,
++	DOT11AC = 2,
++	SLM_SESSIONIZATION = 3,
++	DOT11AC_OPMODE = 4,
++	SAP32STA = 5,
++	TDLS = 6,
++	P2P_GO_NOA_DECOUPLE_INIT_SCAN = 7,
++	WLANACTIVE_OFFLOAD = 8,
++	BEACON_OFFLOAD = 9,
++	SCAN_OFFLOAD = 10,
++	ROAM_OFFLOAD = 11,
++	BCN_MISS_OFFLOAD = 12,
++	STA_POWERSAVE = 13,
++	STA_ADVANCED_PWRSAVE = 14,
++	AP_UAPSD = 15,
++	AP_DFS = 16,
++	BLOCKACK = 17,
++	PHY_ERR = 18,
++	BCN_FILTER = 19,
++	RTT = 20,
++	RATECTRL = 21,
++	WOW = 22,
++	WLAN_ROAM_SCAN_OFFLOAD = 23,
++	SPECULATIVE_PS_POLL = 24,
++	SCAN_SCH = 25,
++	IBSS_HEARTBEAT_OFFLOAD = 26,
++	WLAN_SCAN_OFFLOAD = 27,
++	WLAN_PERIODIC_TX_PTRN = 28,
++	ADVANCE_TDLS = 29,
++	BATCH_SCAN = 30,
++	FW_IN_TX_PATH = 31,
++	EXTENDED_NSOFFLOAD_SLOT = 32,
++	CH_SWITCH_V1 = 33,
++	HT40_OBSS_SCAN = 34,
++	UPDATE_CHANNEL_LIST = 35,
++	WLAN_MCADDR_FLT = 36,
++	WLAN_CH144 = 37,
++	NAN = 38,
++	TDLS_SCAN_COEXISTENCE = 39,
++	LINK_LAYER_STATS_MEAS = 40,
++	MU_MIMO = 41,
++	EXTENDED_SCAN = 42,
++	DYNAMIC_WMM_PS = 43,
++	MAC_SPOOFED_SCAN = 44,
++	BMU_ERROR_GENERIC_RECOVERY = 45,
++	DISA = 46,
++	FW_STATS = 47,
++	WPS_PRBRSP_TMPL = 48,
++	BCN_IE_FLT_DELTA = 49,
++	TDLS_OFF_CHANNEL = 51,
++	RTT3 = 52,
++	MGMT_FRAME_LOGGING = 53,
++	ENHANCED_TXBD_COMPLETION = 54,
++	LOGGING_ENHANCEMENT = 55,
++	EXT_SCAN_ENHANCED = 56,
++	MEMORY_DUMP_SUPPORTED = 57,
++	PER_PKT_STATS_SUPPORTED = 58,
++	EXT_LL_STAT = 60,
++	WIFI_CONFIG = 61,
++	ANTENNA_DIVERSITY_SELECTION = 62,
++
++	MAX_FEATURE_SUPPORTED = 128,
++};
++
++void wcn36xx_firmware_set_feat_caps(u32 *bitmap,
++				    enum wcn36xx_firmware_feat_caps cap);
++int wcn36xx_firmware_get_feat_caps(u32 *bitmap,
++				   enum wcn36xx_firmware_feat_caps cap);
++void wcn36xx_firmware_clear_feat_caps(u32 *bitmap,
++				      enum wcn36xx_firmware_feat_caps cap);
++
++const char *wcn36xx_firmware_get_cap_name(enum wcn36xx_firmware_feat_caps x);
++
++#endif /* _FIRMWARE_H_ */
++
+diff -Nur ./wcn36xx/hal.h ./wcn36xx_new/hal.h
+--- ./wcn36xx/hal.h	2022-12-05 20:37:36.982069100 +0800
++++ ./wcn36xx_new/hal.h	2022-12-05 20:37:03.775113700 +0800
+@@ -359,6 +359,8 @@
+ 	WCN36XX_HAL_START_SCAN_OFFLOAD_RSP = 205,
+ 	WCN36XX_HAL_STOP_SCAN_OFFLOAD_REQ = 206,
+ 	WCN36XX_HAL_STOP_SCAN_OFFLOAD_RSP = 207,
++	WCN36XX_HAL_UPDATE_CHANNEL_LIST_REQ = 208,
++	WCN36XX_HAL_UPDATE_CHANNEL_LIST_RSP = 209,
+ 	WCN36XX_HAL_SCAN_OFFLOAD_IND = 210,
+ 
+ 	WCN36XX_HAL_AVOID_FREQ_RANGE_IND = 233,
+@@ -1353,6 +1355,36 @@
+ 	u32 status;
+ } __packed;
+ 
++#define WCN36XX_HAL_CHAN_REG1_MIN_PWR_MASK  0x000000ff
++#define WCN36XX_HAL_CHAN_REG1_MAX_PWR_MASK  0x0000ff00
++#define WCN36XX_HAL_CHAN_REG1_REG_PWR_MASK  0x00ff0000
++#define WCN36XX_HAL_CHAN_REG1_CLASS_ID_MASK 0xff000000
++#define WCN36XX_HAL_CHAN_REG2_ANT_GAIN_MASK 0x000000ff
++#define WCN36XX_HAL_CHAN_INFO_FLAG_PASSIVE  BIT(7)
++#define WCN36XX_HAL_CHAN_INFO_FLAG_DFS      BIT(10)
++#define WCN36XX_HAL_CHAN_INFO_FLAG_HT       BIT(11)
++#define WCN36XX_HAL_CHAN_INFO_FLAG_VHT      BIT(12)
++#define WCN36XX_HAL_CHAN_INFO_PHY_11A       0
++#define WCN36XX_HAL_CHAN_INFO_PHY_11BG      1
++#define WCN36XX_HAL_DEFAULT_ANT_GAIN        6
++#define WCN36XX_HAL_DEFAULT_MIN_POWER       6
++
++struct wcn36xx_hal_channel_param {
++	u32 mhz;
++	u32 band_center_freq1;
++	u32 band_center_freq2;
++	u32 channel_info;
++	u32 reg_info_1;
++	u32 reg_info_2;
++} __packed;
++
++struct wcn36xx_hal_update_channel_list_req_msg {
++	struct wcn36xx_hal_msg_header header;
++
++	u8 num_channel;
++	struct wcn36xx_hal_channel_param channels[80];
++} __packed;
++
+ enum wcn36xx_hal_rate_index {
+ 	HW_RATE_INDEX_1MBPS	= 0x82,
+ 	HW_RATE_INDEX_2MBPS	= 0x84,
+@@ -1929,7 +1961,7 @@
+ 
+ 	/* HAL should update the existing BSS entry, if this flag is set.
+ 	 * UMAC will set this flag in case of reassoc, where we want to
+-	 * resue the the old BSSID and still return success 0 = Add, 1 =
++	 * resue the old BSSID and still return success 0 = Add, 1 =
+ 	 * Update */
+ 	u8 action;
+ 
+@@ -2066,7 +2098,7 @@
+ 
+ 	/* HAL should update the existing BSS entry, if this flag is set.
+ 	 * UMAC will set this flag in case of reassoc, where we want to
+-	 * resue the the old BSSID and still return success 0 = Add, 1 =
++	 * resue the old BSSID and still return success 0 = Add, 1 =
+ 	 * Update */
+ 	u8 action;
+ 
+@@ -2594,7 +2626,12 @@
+ 	HAL_TX_RATE_SGI = 0x8,
+ 
+ 	/* Rate with Long guard interval */
+-	HAL_TX_RATE_LGI = 0x10
++	HAL_TX_RATE_LGI = 0x10,
++
++	/* VHT rates */
++	HAL_TX_RATE_VHT20  = 0x20,
++	HAL_TX_RATE_VHT40  = 0x40,
++	HAL_TX_RATE_VHT80  = 0x80,
+ };
+ 
+ struct ani_global_class_a_stats_info {
+@@ -2640,7 +2677,7 @@
+ 	 * management information base (MIB) object is enabled */
+ 	u32 rx_wep_unencrypted_frm_cnt;
+ 
+-	/* The number of received MSDU packets that that the 802.11 station
++	/* The number of received MSDU packets that the 802.11 station
+ 	 * discarded because of MIC failures */
+ 	u32 rx_mic_fail_cnt;
+ 
+@@ -3384,11 +3421,11 @@
+ 
+ struct wcn36xx_hal_enter_imps_req_msg {
+ 	struct wcn36xx_hal_msg_header header;
+-};
++} __packed;
+ 
+-struct wcn36xx_hal_exit_imps_req {
++struct wcn36xx_hal_exit_imps_req_msg {
+ 	struct wcn36xx_hal_msg_header header;
+-};
++} __packed;
+ 
+ struct wcn36xx_hal_enter_bmps_req_msg {
+ 	struct wcn36xx_hal_msg_header header;
+@@ -3427,9 +3464,6 @@
+ 
+ /* Beacon Filtering data structures */
+ 
+-/* The above structure would be followed by multiple of below mentioned
+- * structure
+- */
+ struct beacon_filter_ie {
+ 	u8 element_id;
+ 	u8 check_ie_presence;
+@@ -3437,7 +3471,27 @@
+ 	u8 value;
+ 	u8 bitmask;
+ 	u8 ref;
+-};
++} __packed;
++
++#define WCN36XX_FILTER_CAPABILITY_MASK		0x73cf
++#define WCN36XX_FILTER_IE_DS_CHANNEL_MASK	0x00
++#define WCN36XX_FILTER_IE_ERP_FILTER_MASK	0xF8
++#define WCN36XX_FILTER_IE_EDCA_FILTER_MASK	0xF0
++#define WCN36XX_FILTER_IE_QOS_FILTER_MASK	0xF0
++#define WCN36XX_FILTER_IE_CHANNEL_SWITCH_MASK	0x00
++#define WCN36XX_FILTER_IE_HT_BYTE0_FILTER_MASK	0x00
++#define WCN36XX_FILTER_IE_HT_BYTE1_FILTER_MASK	0xF8
++#define WCN36XX_FILTER_IE_HT_BYTE2_FILTER_MASK	0xEB
++#define WCN36XX_FILTER_IE_HT_BYTE5_FILTER_MASK	0xFD
++#define WCN36XX_FILTER_IE_PWR_CONSTRAINT_MASK	0x00
++#define WCN36XX_FILTER_IE_OPMODE_NOTIF_MASK	0x00
++#define WCN36XX_FILTER_IE_VHTOP_CHWIDTH_MASK	0xFC
++#define WCN36XX_FILTER_IE_RSN_MASK		0x00
++#define WCN36XX_FILTER_IE_VENDOR_MASK		0x00
++
++/* The above structure would be followed by multiple of below mentioned
++ * structure
++ */
+ 
+ struct wcn36xx_hal_add_bcn_filter_req_msg {
+ 	struct wcn36xx_hal_msg_header header;
+@@ -3448,14 +3502,14 @@
+ 	u16 ie_num;
+ 	u8 bss_index;
+ 	u8 reserved;
+-};
++} __packed;
+ 
+ struct wcn36xx_hal_rem_bcn_filter_req {
+ 	struct wcn36xx_hal_msg_header header;
+ 
+ 	u8 ie_Count;
+ 	u8 rem_ie_id[1];
+-};
++} __packed;
+ 
+ #define WCN36XX_HAL_IPV4_ARP_REPLY_OFFLOAD                  0
+ #define WCN36XX_HAL_IPV6_NEIGHBOR_DISCOVERY_OFFLOAD         1
+@@ -3464,8 +3518,12 @@
+ #define WCN36XX_HAL_OFFLOAD_DISABLE                         0
+ #define WCN36XX_HAL_OFFLOAD_ENABLE                          1
+ #define WCN36XX_HAL_OFFLOAD_BCAST_FILTER_ENABLE             0x2
++#define WCN36XX_HAL_OFFLOAD_MCAST_FILTER_ENABLE             0x4
++#define WCN36XX_HAL_OFFLOAD_NS_AND_MCAST_FILTER_ENABLE	\
++	(WCN36XX_HAL_OFFLOAD_ENABLE | WCN36XX_HAL_OFFLOAD_MCAST_FILTER_ENABLE)
+ #define WCN36XX_HAL_OFFLOAD_ARP_AND_BCAST_FILTER_ENABLE	\
+-	(HAL_OFFLOAD_ENABLE|HAL_OFFLOAD_BCAST_FILTER_ENABLE)
++	(WCN36XX_HAL_OFFLOAD_ENABLE | WCN36XX_HAL_OFFLOAD_BCAST_FILTER_ENABLE)
++#define WCN36XX_HAL_IPV6_OFFLOAD_ADDR_MAX		0x02
+ 
+ struct wcn36xx_hal_ns_offload_params {
+ 	u8 src_ipv6_addr[WCN36XX_HAL_IPV6_ADDR_LEN];
+@@ -3487,10 +3545,10 @@
+ 	/* slot index for this offload */
+ 	u32 slot_index;
+ 	u8 bss_index;
+-};
++} __packed;
+ 
+ struct wcn36xx_hal_host_offload_req {
+-	u8 offload_Type;
++	u8 offload_type;
+ 
+ 	/* enable or disable */
+ 	u8 enable;
+@@ -3499,13 +3557,13 @@
+ 		u8 host_ipv4_addr[4];
+ 		u8 host_ipv6_addr[WCN36XX_HAL_IPV6_ADDR_LEN];
+ 	} u;
+-};
++} __packed;
+ 
+ struct wcn36xx_hal_host_offload_req_msg {
+ 	struct wcn36xx_hal_msg_header header;
+ 	struct wcn36xx_hal_host_offload_req host_offload_params;
+ 	struct wcn36xx_hal_ns_offload_params ns_offload_params;
+-};
++} __packed;
+ 
+ /* Packet Types. */
+ #define WCN36XX_HAL_KEEP_ALIVE_NULL_PKT              1
+@@ -4084,7 +4142,7 @@
+ 	/* Length of the responce message */
+ 	u32 rsp_length;
+ 
+-	/* FIXME: Currently considering the the responce will be less than
++	/* FIXME: Currently considering the responce will be less than
+ 	 * 100bytes */
+ 	u8 rsp_buffer[DUMPCMD_RSP_BUFFER];
+ } __packed;
+@@ -4700,74 +4758,6 @@
+ 	u32 status;
+ } __packed;
+ 
+-/* Capability bitmap exchange definitions and macros starts */
+-
+-enum place_holder_in_cap_bitmap {
+-	MCC = 0,
+-	P2P = 1,
+-	DOT11AC = 2,
+-	SLM_SESSIONIZATION = 3,
+-	DOT11AC_OPMODE = 4,
+-	SAP32STA = 5,
+-	TDLS = 6,
+-	P2P_GO_NOA_DECOUPLE_INIT_SCAN = 7,
+-	WLANACTIVE_OFFLOAD = 8,
+-	BEACON_OFFLOAD = 9,
+-	SCAN_OFFLOAD = 10,
+-	ROAM_OFFLOAD = 11,
+-	BCN_MISS_OFFLOAD = 12,
+-	STA_POWERSAVE = 13,
+-	STA_ADVANCED_PWRSAVE = 14,
+-	AP_UAPSD = 15,
+-	AP_DFS = 16,
+-	BLOCKACK = 17,
+-	PHY_ERR = 18,
+-	BCN_FILTER = 19,
+-	RTT = 20,
+-	RATECTRL = 21,
+-	WOW = 22,
+-	WLAN_ROAM_SCAN_OFFLOAD = 23,
+-	SPECULATIVE_PS_POLL = 24,
+-	SCAN_SCH = 25,
+-	IBSS_HEARTBEAT_OFFLOAD = 26,
+-	WLAN_SCAN_OFFLOAD = 27,
+-	WLAN_PERIODIC_TX_PTRN = 28,
+-	ADVANCE_TDLS = 29,
+-	BATCH_SCAN = 30,
+-	FW_IN_TX_PATH = 31,
+-	EXTENDED_NSOFFLOAD_SLOT = 32,
+-	CH_SWITCH_V1 = 33,
+-	HT40_OBSS_SCAN = 34,
+-	UPDATE_CHANNEL_LIST = 35,
+-	WLAN_MCADDR_FLT = 36,
+-	WLAN_CH144 = 37,
+-	NAN = 38,
+-	TDLS_SCAN_COEXISTENCE = 39,
+-	LINK_LAYER_STATS_MEAS = 40,
+-	MU_MIMO = 41,
+-	EXTENDED_SCAN = 42,
+-	DYNAMIC_WMM_PS = 43,
+-	MAC_SPOOFED_SCAN = 44,
+-	BMU_ERROR_GENERIC_RECOVERY = 45,
+-	DISA = 46,
+-	FW_STATS = 47,
+-	WPS_PRBRSP_TMPL = 48,
+-	BCN_IE_FLT_DELTA = 49,
+-	TDLS_OFF_CHANNEL = 51,
+-	RTT3 = 52,
+-	MGMT_FRAME_LOGGING = 53,
+-	ENHANCED_TXBD_COMPLETION = 54,
+-	LOGGING_ENHANCEMENT = 55,
+-	EXT_SCAN_ENHANCED = 56,
+-	MEMORY_DUMP_SUPPORTED = 57,
+-	PER_PKT_STATS_SUPPORTED = 58,
+-	EXT_LL_STAT = 60,
+-	WIFI_CONFIG = 61,
+-	ANTENNA_DIVERSITY_SELECTION = 62,
+-
+-	MAX_FEATURE_SUPPORTED = 128,
+-};
+-
+ #define WCN36XX_HAL_CAPS_SIZE 4
+ 
+ struct wcn36xx_hal_feat_caps_msg {
+@@ -4901,7 +4891,7 @@
+ 	u64 key_replay_counter;
+ 
+ 	u8 bss_index;
+-};
++} __packed;
+ 
+ struct wcn36xx_hal_gtk_offload_rsp_msg {
+ 	struct wcn36xx_hal_msg_header header;
+@@ -4915,7 +4905,7 @@
+ struct wcn36xx_hal_gtk_offload_get_info_req_msg {
+ 	struct wcn36xx_hal_msg_header header;
+ 	u8 bss_index;
+-};
++} __packed;
+ 
+ struct wcn36xx_hal_gtk_offload_get_info_rsp_msg {
+ 	struct wcn36xx_hal_msg_header header;
+@@ -4939,7 +4929,7 @@
+ 	u32 igtk_rekey_count;
+ 
+ 	u8 bss_index;
+-};
++} __packed;
+ 
+ struct dhcp_info {
+ 	/* Indicates the device mode which indicates about the DHCP activity */
+diff -Nur ./wcn36xx/main.c ./wcn36xx_new/main.c
+--- ./wcn36xx/main.c	2022-12-05 20:37:36.999315000 +0800
++++ ./wcn36xx_new/main.c	2022-12-05 20:37:03.942100600 +0800
+@@ -25,8 +25,10 @@
+ #include <linux/rpmsg.h>
+ #include <linux/soc/qcom/smem_state.h>
+ #include <linux/soc/qcom/wcnss_ctrl.h>
++#include <net/ipv6.h>
+ #include "wcn36xx.h"
+ #include "testmode.h"
++#include "firmware.h"
+ 
+ unsigned int wcn36xx_dbg_mask;
+ module_param_named(debug_mask, wcn36xx_dbg_mask, uint, 0644);
+@@ -84,7 +86,9 @@
+ 	CHAN5G(5620, 124, PHY_QUADRUPLE_CHANNEL_20MHZ_LOW_40MHZ_HIGH),
+ 	CHAN5G(5640, 128, PHY_QUADRUPLE_CHANNEL_20MHZ_HIGH_40MHZ_HIGH),
+ 	CHAN5G(5660, 132, PHY_QUADRUPLE_CHANNEL_20MHZ_LOW_40MHZ_LOW),
++	CHAN5G(5680, 136, PHY_QUADRUPLE_CHANNEL_20MHZ_HIGH_40MHZ_LOW),
+ 	CHAN5G(5700, 140, PHY_QUADRUPLE_CHANNEL_20MHZ_LOW_40MHZ_HIGH),
++	CHAN5G(5720, 144, PHY_QUADRUPLE_CHANNEL_20MHZ_HIGH_40MHZ_HIGH),
+ 	CHAN5G(5745, 149, PHY_QUADRUPLE_CHANNEL_20MHZ_LOW_40MHZ_LOW),
+ 	CHAN5G(5765, 153, PHY_QUADRUPLE_CHANNEL_20MHZ_HIGH_40MHZ_LOW),
+ 	CHAN5G(5785, 157, PHY_QUADRUPLE_CHANNEL_20MHZ_LOW_40MHZ_HIGH),
+@@ -134,7 +138,9 @@
+ 		.cap =	IEEE80211_HT_CAP_GRN_FLD |
+ 			IEEE80211_HT_CAP_SGI_20 |
+ 			IEEE80211_HT_CAP_DSSSCCK40 |
+-			IEEE80211_HT_CAP_LSIG_TXOP_PROT,
++			IEEE80211_HT_CAP_LSIG_TXOP_PROT |
++			IEEE80211_HT_CAP_SGI_40 |
++			IEEE80211_HT_CAP_SUP_WIDTH_20_40,
+ 		.ht_supported = true,
+ 		.ampdu_factor = IEEE80211_HT_MAX_AMPDU_64K,
+ 		.ampdu_density = IEEE80211_HT_MPDU_DENSITY_16,
+@@ -172,7 +178,9 @@
+ #ifdef CONFIG_PM
+ 
+ static const struct wiphy_wowlan_support wowlan_support = {
+-	.flags = WIPHY_WOWLAN_ANY
++	.flags = WIPHY_WOWLAN_ANY	|
++		 WIPHY_WOWLAN_MAGIC_PKT	|
++		 WIPHY_WOWLAN_SUPPORTS_GTK_REKEY
+ };
+ 
+ #endif
+@@ -185,84 +193,15 @@
+ 	       sta_priv->sta_index;
+ }
+ 
+-static const char * const wcn36xx_caps_names[] = {
+-	"MCC",				/* 0 */
+-	"P2P",				/* 1 */
+-	"DOT11AC",			/* 2 */
+-	"SLM_SESSIONIZATION",		/* 3 */
+-	"DOT11AC_OPMODE",		/* 4 */
+-	"SAP32STA",			/* 5 */
+-	"TDLS",				/* 6 */
+-	"P2P_GO_NOA_DECOUPLE_INIT_SCAN",/* 7 */
+-	"WLANACTIVE_OFFLOAD",		/* 8 */
+-	"BEACON_OFFLOAD",		/* 9 */
+-	"SCAN_OFFLOAD",			/* 10 */
+-	"ROAM_OFFLOAD",			/* 11 */
+-	"BCN_MISS_OFFLOAD",		/* 12 */
+-	"STA_POWERSAVE",		/* 13 */
+-	"STA_ADVANCED_PWRSAVE",		/* 14 */
+-	"AP_UAPSD",			/* 15 */
+-	"AP_DFS",			/* 16 */
+-	"BLOCKACK",			/* 17 */
+-	"PHY_ERR",			/* 18 */
+-	"BCN_FILTER",			/* 19 */
+-	"RTT",				/* 20 */
+-	"RATECTRL",			/* 21 */
+-	"WOW",				/* 22 */
+-	"WLAN_ROAM_SCAN_OFFLOAD",	/* 23 */
+-	"SPECULATIVE_PS_POLL",		/* 24 */
+-	"SCAN_SCH",			/* 25 */
+-	"IBSS_HEARTBEAT_OFFLOAD",	/* 26 */
+-	"WLAN_SCAN_OFFLOAD",		/* 27 */
+-	"WLAN_PERIODIC_TX_PTRN",	/* 28 */
+-	"ADVANCE_TDLS",			/* 29 */
+-	"BATCH_SCAN",			/* 30 */
+-	"FW_IN_TX_PATH",		/* 31 */
+-	"EXTENDED_NSOFFLOAD_SLOT",	/* 32 */
+-	"CH_SWITCH_V1",			/* 33 */
+-	"HT40_OBSS_SCAN",		/* 34 */
+-	"UPDATE_CHANNEL_LIST",		/* 35 */
+-	"WLAN_MCADDR_FLT",		/* 36 */
+-	"WLAN_CH144",			/* 37 */
+-	"NAN",				/* 38 */
+-	"TDLS_SCAN_COEXISTENCE",	/* 39 */
+-	"LINK_LAYER_STATS_MEAS",	/* 40 */
+-	"MU_MIMO",			/* 41 */
+-	"EXTENDED_SCAN",		/* 42 */
+-	"DYNAMIC_WMM_PS",		/* 43 */
+-	"MAC_SPOOFED_SCAN",		/* 44 */
+-	"BMU_ERROR_GENERIC_RECOVERY",	/* 45 */
+-	"DISA",				/* 46 */
+-	"FW_STATS",			/* 47 */
+-	"WPS_PRBRSP_TMPL",		/* 48 */
+-	"BCN_IE_FLT_DELTA",		/* 49 */
+-	"TDLS_OFF_CHANNEL",		/* 51 */
+-	"RTT3",				/* 52 */
+-	"MGMT_FRAME_LOGGING",		/* 53 */
+-	"ENHANCED_TXBD_COMPLETION",	/* 54 */
+-	"LOGGING_ENHANCEMENT",		/* 55 */
+-	"EXT_SCAN_ENHANCED",		/* 56 */
+-	"MEMORY_DUMP_SUPPORTED",	/* 57 */
+-	"PER_PKT_STATS_SUPPORTED",	/* 58 */
+-	"EXT_LL_STAT",			/* 60 */
+-	"WIFI_CONFIG",			/* 61 */
+-	"ANTENNA_DIVERSITY_SELECTION",	/* 62 */
+-};
+-
+-static const char *wcn36xx_get_cap_name(enum place_holder_in_cap_bitmap x)
+-{
+-	if (x >= ARRAY_SIZE(wcn36xx_caps_names))
+-		return "UNKNOWN";
+-	return wcn36xx_caps_names[x];
+-}
+-
+ static void wcn36xx_feat_caps_info(struct wcn36xx *wcn)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i < MAX_FEATURE_SUPPORTED; i++) {
+-		if (get_feat_caps(wcn->fw_feat_caps, i))
+-			wcn36xx_dbg(WCN36XX_DBG_MAC, "FW Cap %s\n", wcn36xx_get_cap_name(i));
++		if (wcn36xx_firmware_get_feat_caps(wcn->fw_feat_caps, i)) {
++			wcn36xx_dbg(WCN36XX_DBG_MAC, "FW Cap %s\n",
++				    wcn36xx_firmware_get_cap_name(i));
++		}
+ 	}
+ }
+ 
+@@ -293,23 +232,16 @@
+ 		goto out_free_dxe_pool;
+ 	}
+ 
+-	wcn->hal_buf = kmalloc(WCN36XX_HAL_BUF_SIZE, GFP_KERNEL);
+-	if (!wcn->hal_buf) {
+-		wcn36xx_err("Failed to allocate smd buf\n");
+-		ret = -ENOMEM;
+-		goto out_free_dxe_ctl;
+-	}
+-
+ 	ret = wcn36xx_smd_load_nv(wcn);
+ 	if (ret) {
+ 		wcn36xx_err("Failed to push NV to chip\n");
+-		goto out_free_smd_buf;
++		goto out_free_dxe_ctl;
+ 	}
+ 
+ 	ret = wcn36xx_smd_start(wcn);
+ 	if (ret) {
+ 		wcn36xx_err("Failed to start chip\n");
+-		goto out_free_smd_buf;
++		goto out_free_dxe_ctl;
+ 	}
+ 
+ 	if (!wcn36xx_is_fw_version(wcn, 1, 2, 2, 24)) {
+@@ -331,13 +263,12 @@
+ 
+ 	INIT_LIST_HEAD(&wcn->vif_list);
+ 	spin_lock_init(&wcn->dxe_lock);
++	spin_lock_init(&wcn->survey_lock);
+ 
+ 	return 0;
+ 
+ out_smd_stop:
+ 	wcn36xx_smd_stop(wcn);
+-out_free_smd_buf:
+-	kfree(wcn->hal_buf);
+ out_free_dxe_ctl:
+ 	wcn36xx_dxe_free_ctl_blks(wcn);
+ out_free_dxe_pool:
+@@ -372,8 +303,6 @@
+ 
+ 	wcn36xx_dxe_free_mem_pools(wcn);
+ 	wcn36xx_dxe_free_ctl_blks(wcn);
+-
+-	kfree(wcn->hal_buf);
+ }
+ 
+ static void wcn36xx_change_ps(struct wcn36xx *wcn, bool enable)
+@@ -384,7 +313,7 @@
+ 	list_for_each_entry(tmp, &wcn->vif_list, list) {
+ 		vif = wcn36xx_priv_to_vif(tmp);
+ 		if (enable && !wcn->sw_scan) {
+-			if (vif->bss_conf.ps) /* ps allowed ? */
++			if (vif->cfg.ps) /* ps allowed ? */
+ 				wcn36xx_pmc_enter_bmps_state(wcn, vif);
+ 		} else {
+ 			wcn36xx_pmc_exit_bmps_state(wcn, vif);
+@@ -396,16 +325,47 @@
+ {
+ 	struct ieee80211_vif *vif = NULL;
+ 	struct wcn36xx_vif *tmp;
++	struct ieee80211_supported_band *band;
++	struct ieee80211_channel *channel = NULL;
++	unsigned long flags;
++	int i, j;
++
++	for (i = 0; i < ARRAY_SIZE(wcn->hw->wiphy->bands); i++) {
++		band = wcn->hw->wiphy->bands[i];
++		if (!band)
++			break;
++		for (j = 0; j < band->n_channels; j++) {
++			if (HW_VALUE_CHANNEL(band->channels[j].hw_value) == ch) {
++				channel = &band->channels[j];
++				break;
++			}
++		}
++		if (channel)
++			break;
++	}
++
++	if (!channel) {
++		wcn36xx_err("Cannot tune to channel %d\n", ch);
++		return;
++	}
++
++	spin_lock_irqsave(&wcn->survey_lock, flags);
++	wcn->band = band;
++	wcn->channel = channel;
++	spin_unlock_irqrestore(&wcn->survey_lock, flags);
+ 
+ 	list_for_each_entry(tmp, &wcn->vif_list, list) {
+ 		vif = wcn36xx_priv_to_vif(tmp);
+ 		wcn36xx_smd_switch_channel(wcn, vif, ch);
+ 	}
++
++	return;
+ }
+ 
+ static int wcn36xx_config(struct ieee80211_hw *hw, u32 changed)
+ {
+ 	struct wcn36xx *wcn = hw->priv;
++	int ret;
+ 
+ 	wcn36xx_dbg(WCN36XX_DBG_MAC, "mac config changed 0x%08x\n", changed);
+ 
+@@ -416,19 +376,35 @@
+ 		wcn36xx_dbg(WCN36XX_DBG_MAC, "wcn36xx_config channel switch=%d\n",
+ 			    ch);
+ 
+-		if (wcn->sw_scan_opchannel == ch) {
++		if (wcn->sw_scan_opchannel == ch && wcn->sw_scan_channel) {
+ 			/* If channel is the initial operating channel, we may
+ 			 * want to receive/transmit regular data packets, then
+ 			 * simply stop the scan session and exit PS mode.
+ 			 */
+-			wcn36xx_smd_finish_scan(wcn, HAL_SYS_MODE_SCAN,
+-						wcn->sw_scan_vif);
++			if (wcn->sw_scan_channel)
++				wcn36xx_smd_end_scan(wcn, wcn->sw_scan_channel);
++			if (wcn->sw_scan_init) {
++				wcn36xx_smd_finish_scan(wcn, HAL_SYS_MODE_SCAN,
++							wcn->sw_scan_vif);
++			}
+ 		} else if (wcn->sw_scan) {
+ 			/* A scan is ongoing, do not change the operating
+ 			 * channel, but start a scan session on the channel.
+ 			 */
+-			wcn36xx_smd_init_scan(wcn, HAL_SYS_MODE_SCAN,
+-					      wcn->sw_scan_vif);
++			if (wcn->sw_scan_channel)
++				wcn36xx_smd_end_scan(wcn, wcn->sw_scan_channel);
++			if (!wcn->sw_scan_init) {
++				/* This can fail if we are unable to notify the
++				 * operating channel.
++				 */
++				ret = wcn36xx_smd_init_scan(wcn,
++							    HAL_SYS_MODE_SCAN,
++							    wcn->sw_scan_vif);
++				if (ret) {
++					mutex_unlock(&wcn->conf_mutex);
++					return -EIO;
++				}
++			}
+ 			wcn36xx_smd_start_scan(wcn, ch);
+ 		} else {
+ 			wcn36xx_change_opchannel(wcn, ch);
+@@ -438,6 +414,13 @@
+ 	if (changed & IEEE80211_CONF_CHANGE_PS)
+ 		wcn36xx_change_ps(wcn, hw->conf.flags & IEEE80211_CONF_PS);
+ 
++	if (changed & IEEE80211_CONF_CHANGE_IDLE) {
++		if (hw->conf.flags & IEEE80211_CONF_IDLE)
++			wcn36xx_smd_enter_imps(wcn);
++		else
++			wcn36xx_smd_exit_imps(wcn);
++	}
++
+ 	mutex_unlock(&wcn->conf_mutex);
+ 
+ 	return 0;
+@@ -575,12 +558,14 @@
+ 		if (IEEE80211_KEY_FLAG_PAIRWISE & key_conf->flags) {
+ 			sta_priv->is_data_encrypted = true;
+ 			/* Reconfigure bss with encrypt_type */
+-			if (NL80211_IFTYPE_STATION == vif->type)
++			if (NL80211_IFTYPE_STATION == vif->type) {
+ 				wcn36xx_smd_config_bss(wcn,
+ 						       vif,
+ 						       sta,
+ 						       sta->addr,
+ 						       true);
++				wcn36xx_smd_config_sta(wcn, vif, sta);
++			}
+ 
+ 			wcn36xx_smd_set_stakey(wcn,
+ 				vif_priv->encrypt_type,
+@@ -610,15 +595,6 @@
+ 				}
+ 			}
+ 		}
+-		/* FIXME: Only enable bmps support when encryption is enabled.
+-		 * For any reasons, when connected to open/no-security BSS,
+-		 * the wcn36xx controller in bmps mode does not forward
+-		 * 'wake-up' beacons despite AP sends DTIM with station AID.
+-		 * It could be due to a firmware issue or to the way driver
+-		 * configure the station.
+-		 */
+-		if (vif->type == NL80211_IFTYPE_STATION)
+-			vif_priv->allow_bmps = true;
+ 		break;
+ 	case DISABLE_KEY:
+ 		if (!(IEEE80211_KEY_FLAG_PAIRWISE & key_conf->flags)) {
+@@ -656,19 +632,19 @@
+ 			   struct ieee80211_scan_request *hw_req)
+ {
+ 	struct wcn36xx *wcn = hw->priv;
+-	int i;
+ 
+-	if (!get_feat_caps(wcn->fw_feat_caps, SCAN_OFFLOAD)) {
++	if (!wcn36xx_firmware_get_feat_caps(wcn->fw_feat_caps, SCAN_OFFLOAD)) {
+ 		/* fallback to mac80211 software scan */
+ 		return 1;
+ 	}
+ 
+-	/* For unknown reason, the hardware offloaded scan only works with
+-	 * 2.4Ghz channels, fallback to software scan in other cases.
++	/* Firmware scan offload is limited to 48 channels, fallback to
++	 * software driven scanning otherwise.
+ 	 */
+-	for (i = 0; i < hw_req->req.n_channels; i++) {
+-		if (hw_req->req.channels[i]->band != NL80211_BAND_2GHZ)
+-			return 1;
++	if (hw_req->req.n_channels > 48) {
++		wcn36xx_warn("Offload scan aborted, n_channels=%u",
++			     hw_req->req.n_channels);
++		return 1;
+ 	}
+ 
+ 	mutex_lock(&wcn->scan_lock);
+@@ -682,6 +658,7 @@
+ 
+ 	mutex_unlock(&wcn->scan_lock);
+ 
++	wcn36xx_smd_update_channel_list(wcn, &hw_req->req);
+ 	return wcn36xx_smd_start_hw_scan(wcn, vif, &hw_req->req);
+ }
+ 
+@@ -694,7 +671,7 @@
+ 	wcn->scan_aborted = true;
+ 	mutex_unlock(&wcn->scan_lock);
+ 
+-	if (get_feat_caps(wcn->fw_feat_caps, SCAN_OFFLOAD)) {
++	if (wcn36xx_firmware_get_feat_caps(wcn->fw_feat_caps, SCAN_OFFLOAD)) {
+ 		/* ieee80211_scan_completed will be called on FW scan
+ 		 * indication */
+ 		wcn36xx_smd_stop_hw_scan(wcn);
+@@ -708,8 +685,11 @@
+ 	struct wcn36xx *wcn = hw->priv;
+ 	struct wcn36xx_vif *vif_priv = wcn36xx_vif_to_priv(vif);
+ 
++	wcn36xx_dbg(WCN36XX_DBG_MAC, "sw_scan_start");
++
+ 	wcn->sw_scan = true;
+ 	wcn->sw_scan_vif = vif;
++	wcn->sw_scan_channel = 0;
+ 	if (vif_priv->sta_assoc)
+ 		wcn->sw_scan_opchannel = WCN36XX_HW_CHANNEL(wcn);
+ 	else
+@@ -721,8 +701,15 @@
+ {
+ 	struct wcn36xx *wcn = hw->priv;
+ 
++	wcn36xx_dbg(WCN36XX_DBG_MAC, "sw_scan_complete");
++
+ 	/* ensure that any scan session is finished */
+-	wcn36xx_smd_finish_scan(wcn, HAL_SYS_MODE_SCAN, wcn->sw_scan_vif);
++	if (wcn->sw_scan_channel)
++		wcn36xx_smd_end_scan(wcn, wcn->sw_scan_channel);
++	if (wcn->sw_scan_init) {
++		wcn36xx_smd_finish_scan(wcn, HAL_SYS_MODE_SCAN,
++					wcn->sw_scan_vif);
++	}
+ 	wcn->sw_scan = false;
+ 	wcn->sw_scan_opchannel = 0;
+ }
+@@ -733,7 +720,7 @@
+ 	int i, size;
+ 	u16 *rates_table;
+ 	struct wcn36xx_sta *sta_priv = wcn36xx_sta_to_priv(sta);
+-	u32 rates = sta->supp_rates[band];
++	u32 rates = sta->deflink.supp_rates[band];
+ 
+ 	memset(&sta_priv->supported_rates, 0,
+ 		sizeof(sta_priv->supported_rates));
+@@ -759,20 +746,20 @@
+ 		}
+ 	}
+ 
+-	if (sta->ht_cap.ht_supported) {
+-		BUILD_BUG_ON(sizeof(sta->ht_cap.mcs.rx_mask) >
+-			sizeof(sta_priv->supported_rates.supported_mcs_set));
++	if (sta->deflink.ht_cap.ht_supported) {
++		BUILD_BUG_ON(sizeof(sta->deflink.ht_cap.mcs.rx_mask) >
++			     sizeof(sta_priv->supported_rates.supported_mcs_set));
+ 		memcpy(sta_priv->supported_rates.supported_mcs_set,
+-		       sta->ht_cap.mcs.rx_mask,
+-		       sizeof(sta->ht_cap.mcs.rx_mask));
++		       sta->deflink.ht_cap.mcs.rx_mask,
++		       sizeof(sta->deflink.ht_cap.mcs.rx_mask));
+ 	}
+ 
+-	if (sta->vht_cap.vht_supported) {
++	if (sta->deflink.vht_cap.vht_supported) {
+ 		sta_priv->supported_rates.op_rate_mode = STA_11ac;
+ 		sta_priv->supported_rates.vht_rx_mcs_map =
+-				sta->vht_cap.vht_mcs.rx_mcs_map;
++				sta->deflink.vht_cap.vht_mcs.rx_mcs_map;
+ 		sta_priv->supported_rates.vht_tx_mcs_map =
+-				sta->vht_cap.vht_mcs.tx_mcs_map;
++				sta->deflink.vht_cap.vht_mcs.tx_mcs_map;
+ 	}
+ }
+ 
+@@ -813,7 +800,7 @@
+ static void wcn36xx_bss_info_changed(struct ieee80211_hw *hw,
+ 				     struct ieee80211_vif *vif,
+ 				     struct ieee80211_bss_conf *bss_conf,
+-				     u32 changed)
++				     u64 changed)
+ {
+ 	struct wcn36xx *wcn = hw->priv;
+ 	struct sk_buff *skb = NULL;
+@@ -821,7 +808,7 @@
+ 	enum wcn36xx_hal_link_state link_state;
+ 	struct wcn36xx_vif *vif_priv = wcn36xx_vif_to_priv(vif);
+ 
+-	wcn36xx_dbg(WCN36XX_DBG_MAC, "mac bss info changed vif %p changed 0x%08x\n",
++	wcn36xx_dbg(WCN36XX_DBG_MAC, "mac bss info changed vif %p changed 0x%llx\n",
+ 		    vif, changed);
+ 
+ 	mutex_lock(&wcn->conf_mutex);
+@@ -860,17 +847,17 @@
+ 		wcn36xx_dbg(WCN36XX_DBG_MAC,
+ 			    "mac bss changed ssid\n");
+ 		wcn36xx_dbg_dump(WCN36XX_DBG_MAC, "ssid ",
+-				 bss_conf->ssid, bss_conf->ssid_len);
++				 vif->cfg.ssid, vif->cfg.ssid_len);
+ 
+-		vif_priv->ssid.length = bss_conf->ssid_len;
++		vif_priv->ssid.length = vif->cfg.ssid_len;
+ 		memcpy(&vif_priv->ssid.ssid,
+-		       bss_conf->ssid,
+-		       bss_conf->ssid_len);
++		       vif->cfg.ssid,
++		       vif->cfg.ssid_len);
+ 	}
+ 
+ 	if (changed & BSS_CHANGED_ASSOC) {
+ 		vif_priv->is_joining = false;
+-		if (bss_conf->assoc) {
++		if (vif->cfg.assoc) {
+ 			struct ieee80211_sta *sta;
+ 			struct wcn36xx_sta *sta_priv;
+ 
+@@ -878,7 +865,7 @@
+ 				    "mac assoc bss %pM vif %pM AID=%d\n",
+ 				     bss_conf->bssid,
+ 				     vif->addr,
+-				     bss_conf->aid);
++				     vif->cfg.aid);
+ 
+ 			vif_priv->sta_assoc = true;
+ 
+@@ -904,20 +891,22 @@
+ 			wcn36xx_smd_config_bss(wcn, vif, sta,
+ 					       bss_conf->bssid,
+ 					       true);
+-			sta_priv->aid = bss_conf->aid;
++			sta_priv->aid = vif->cfg.aid;
+ 			/*
+ 			 * config_sta must be called from  because this is the
+ 			 * place where AID is available.
+ 			 */
+ 			wcn36xx_smd_config_sta(wcn, vif, sta);
++			if (vif->type == NL80211_IFTYPE_STATION)
++				wcn36xx_smd_add_beacon_filter(wcn, vif);
++			wcn36xx_enable_keep_alive_null_packet(wcn, vif);
+ 		} else {
+ 			wcn36xx_dbg(WCN36XX_DBG_MAC,
+ 				    "disassociated bss %pM vif %pM AID=%d\n",
+ 				    bss_conf->bssid,
+ 				    vif->addr,
+-				    bss_conf->aid);
++				    vif->cfg.aid);
+ 			vif_priv->sta_assoc = false;
+-			vif_priv->allow_bmps = false;
+ 			wcn36xx_smd_set_link_st(wcn,
+ 						bss_conf->bssid,
+ 						vif->addr,
+@@ -949,7 +938,7 @@
+ 			wcn36xx_smd_config_bss(wcn, vif, NULL,
+ 					       vif->addr, false);
+ 			skb = ieee80211_beacon_get_tim(hw, vif, &tim_off,
+-						       &tim_len);
++						       &tim_len, 0);
+ 			if (!skb) {
+ 				wcn36xx_err("failed to alloc beacon skb\n");
+ 				goto out;
+@@ -1087,28 +1076,102 @@
+ 
+ #ifdef CONFIG_PM
+ 
++static struct ieee80211_vif *wcn36xx_get_first_assoc_vif(struct wcn36xx *wcn)
++{
++	struct wcn36xx_vif *vif_priv = NULL;
++	struct ieee80211_vif *vif = NULL;
++
++	list_for_each_entry(vif_priv, &wcn->vif_list, list) {
++		if (vif_priv->sta_assoc) {
++			vif = wcn36xx_priv_to_vif(vif_priv);
++			break;
++		}
++	}
++	return vif;
++}
++
+ static int wcn36xx_suspend(struct ieee80211_hw *hw, struct cfg80211_wowlan *wow)
+ {
+ 	struct wcn36xx *wcn = hw->priv;
++	struct ieee80211_vif *vif = NULL;
++	int ret = 0;
+ 
+ 	wcn36xx_dbg(WCN36XX_DBG_MAC, "mac suspend\n");
+ 
+-	flush_workqueue(wcn->hal_ind_wq);
+-	wcn36xx_smd_set_power_params(wcn, true);
+-	return 0;
++	mutex_lock(&wcn->conf_mutex);
++
++	vif = wcn36xx_get_first_assoc_vif(wcn);
++	if (vif) {
++		ret = wcn36xx_smd_arp_offload(wcn, vif, true);
++		if (ret)
++			goto out;
++		ret = wcn36xx_smd_ipv6_ns_offload(wcn, vif, true);
++		if (ret)
++			goto out;
++		ret = wcn36xx_smd_gtk_offload(wcn, vif, true);
++		if (ret)
++			goto out;
++		ret = wcn36xx_smd_set_power_params(wcn, true);
++		if (ret)
++			goto out;
++		ret = wcn36xx_smd_wlan_host_suspend_ind(wcn);
++	}
++
++	/* Disable IRQ, we don't want to handle any packet before mac80211 is
++	 * resumed and ready to receive packets.
++	 */
++	disable_irq(wcn->tx_irq);
++	disable_irq(wcn->rx_irq);
++
++out:
++	mutex_unlock(&wcn->conf_mutex);
++	return ret;
+ }
+ 
+ static int wcn36xx_resume(struct ieee80211_hw *hw)
+ {
+ 	struct wcn36xx *wcn = hw->priv;
++	struct ieee80211_vif *vif = NULL;
+ 
+ 	wcn36xx_dbg(WCN36XX_DBG_MAC, "mac resume\n");
+ 
+-	flush_workqueue(wcn->hal_ind_wq);
+-	wcn36xx_smd_set_power_params(wcn, false);
++	mutex_lock(&wcn->conf_mutex);
++	vif = wcn36xx_get_first_assoc_vif(wcn);
++	if (vif) {
++		wcn36xx_smd_host_resume(wcn);
++		wcn36xx_smd_set_power_params(wcn, false);
++		wcn36xx_smd_gtk_offload_get_info(wcn, vif);
++		wcn36xx_smd_gtk_offload(wcn, vif, false);
++		wcn36xx_smd_ipv6_ns_offload(wcn, vif, false);
++		wcn36xx_smd_arp_offload(wcn, vif, false);
++	}
++
++	enable_irq(wcn->tx_irq);
++	enable_irq(wcn->rx_irq);
++
++	mutex_unlock(&wcn->conf_mutex);
++
+ 	return 0;
+ }
+ 
++static void wcn36xx_set_rekey_data(struct ieee80211_hw *hw,
++				   struct ieee80211_vif *vif,
++				   struct cfg80211_gtk_rekey_data *data)
++{
++	struct wcn36xx *wcn = hw->priv;
++	struct wcn36xx_vif *vif_priv = wcn36xx_vif_to_priv(vif);
++
++	mutex_lock(&wcn->conf_mutex);
++
++	memcpy(vif_priv->rekey_data.kek, data->kek, NL80211_KEK_LEN);
++	memcpy(vif_priv->rekey_data.kck, data->kck, NL80211_KCK_LEN);
++	vif_priv->rekey_data.replay_ctr =
++		cpu_to_le64(be64_to_cpup((__be64 *)data->replay_ctr));
++	vif_priv->rekey_data.valid = true;
++
++	mutex_unlock(&wcn->conf_mutex);
++}
++
+ #endif
+ 
+ static int wcn36xx_ampdu_action(struct ieee80211_hw *hw,
+@@ -1122,7 +1185,7 @@
+ 	u16 tid = params->tid;
+ 	u16 *ssn = &params->ssn;
+ 	int ret = 0;
+-	u8 session;
++	int session;
+ 
+ 	wcn36xx_dbg(WCN36XX_DBG_MAC, "mac ampdu action action %d tid %d\n",
+ 		    action, tid);
+@@ -1134,18 +1197,32 @@
+ 		sta_priv->tid = tid;
+ 		session = wcn36xx_smd_add_ba_session(wcn, sta, tid, ssn, 0,
+ 						     get_sta_index(vif, sta_priv));
++		if (session < 0) {
++			ret = session;
++			goto out;
++		}
+ 		wcn36xx_smd_add_ba(wcn, session);
+-		wcn36xx_smd_trigger_ba(wcn, get_sta_index(vif, sta_priv), tid,
+-				       session);
+ 		break;
+ 	case IEEE80211_AMPDU_RX_STOP:
+-		wcn36xx_smd_del_ba(wcn, tid, get_sta_index(vif, sta_priv));
++		wcn36xx_smd_del_ba(wcn, tid, 0, get_sta_index(vif, sta_priv));
+ 		break;
+ 	case IEEE80211_AMPDU_TX_START:
+ 		spin_lock_bh(&sta_priv->ampdu_lock);
+ 		sta_priv->ampdu_state[tid] = WCN36XX_AMPDU_START;
+ 		spin_unlock_bh(&sta_priv->ampdu_lock);
+ 
++		/* Replace the mac80211 ssn with the firmware one */
++		wcn36xx_dbg(WCN36XX_DBG_MAC, "mac ampdu ssn = %u\n", *ssn);
++		wcn36xx_smd_trigger_ba(wcn, get_sta_index(vif, sta_priv), tid, ssn);
++		wcn36xx_dbg(WCN36XX_DBG_MAC, "mac ampdu fw-ssn = %u\n", *ssn);
++
++		/* Start BA session */
++		session = wcn36xx_smd_add_ba_session(wcn, sta, tid, ssn, 1,
++						     get_sta_index(vif, sta_priv));
++		if (session < 0) {
++			ret = session;
++			goto out;
++		}
+ 		ret = IEEE80211_AMPDU_TX_START_IMMEDIATE;
+ 		break;
+ 	case IEEE80211_AMPDU_TX_OPERATIONAL:
+@@ -1153,8 +1230,6 @@
+ 		sta_priv->ampdu_state[tid] = WCN36XX_AMPDU_OPERATIONAL;
+ 		spin_unlock_bh(&sta_priv->ampdu_lock);
+ 
+-		wcn36xx_smd_add_ba_session(wcn, sta, tid, ssn, 1,
+-			get_sta_index(vif, sta_priv));
+ 		break;
+ 	case IEEE80211_AMPDU_TX_STOP_FLUSH:
+ 	case IEEE80211_AMPDU_TX_STOP_FLUSH_CONT:
+@@ -1163,17 +1238,115 @@
+ 		sta_priv->ampdu_state[tid] = WCN36XX_AMPDU_NONE;
+ 		spin_unlock_bh(&sta_priv->ampdu_lock);
+ 
++		wcn36xx_smd_del_ba(wcn, tid, 1, get_sta_index(vif, sta_priv));
+ 		ieee80211_stop_tx_ba_cb_irqsafe(vif, sta->addr, tid);
+ 		break;
+ 	default:
+ 		wcn36xx_err("Unknown AMPDU action\n");
+ 	}
+ 
++out:
+ 	mutex_unlock(&wcn->conf_mutex);
+ 
+ 	return ret;
+ }
+ 
++#if IS_ENABLED(CONFIG_IPV6)
++static void wcn36xx_ipv6_addr_change(struct ieee80211_hw *hw,
++				     struct ieee80211_vif *vif,
++				     struct inet6_dev *idev)
++{
++	struct wcn36xx_vif *vif_priv = wcn36xx_vif_to_priv(vif);
++	struct inet6_ifaddr *ifa;
++	int idx = 0;
++
++	memset(vif_priv->tentative_addrs, 0, sizeof(vif_priv->tentative_addrs));
++
++	read_lock_bh(&idev->lock);
++	list_for_each_entry(ifa, &idev->addr_list, if_list) {
++		vif_priv->target_ipv6_addrs[idx] = ifa->addr;
++		if (ifa->flags & IFA_F_TENTATIVE)
++			__set_bit(idx, vif_priv->tentative_addrs);
++		idx++;
++		if (idx >= WCN36XX_HAL_IPV6_OFFLOAD_ADDR_MAX)
++			break;
++		wcn36xx_dbg(WCN36XX_DBG_MAC, "%pI6 %s\n", &ifa->addr,
++			    (ifa->flags & IFA_F_TENTATIVE) ? "tentative" : NULL);
++	}
++	read_unlock_bh(&idev->lock);
++
++	vif_priv->num_target_ipv6_addrs = idx;
++}
++#endif
++
++static void wcn36xx_flush(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++			  u32 queues, bool drop)
++{
++	struct wcn36xx *wcn = hw->priv;
++
++	if (wcn36xx_dxe_tx_flush(wcn)) {
++		wcn36xx_err("Failed to flush hardware tx queues\n");
++	}
++}
++
++static int wcn36xx_get_survey(struct ieee80211_hw *hw, int idx,
++			      struct survey_info *survey)
++{
++	struct wcn36xx *wcn = hw->priv;
++	struct ieee80211_supported_band *sband;
++	struct wcn36xx_chan_survey *chan_survey;
++	int band_idx;
++	unsigned long flags;
++
++	sband = wcn->hw->wiphy->bands[NL80211_BAND_2GHZ];
++	band_idx = idx;
++	if (band_idx >= sband->n_channels) {
++		band_idx -= sband->n_channels;
++		sband = wcn->hw->wiphy->bands[NL80211_BAND_5GHZ];
++	}
++
++	if (!sband || band_idx >= sband->n_channels)
++		return -ENOENT;
++
++	spin_lock_irqsave(&wcn->survey_lock, flags);
++
++	chan_survey = &wcn->chan_survey[idx];
++	survey->channel = &sband->channels[band_idx];
++	survey->noise = chan_survey->rssi - chan_survey->snr;
++	survey->filled = 0;
++
++	if (chan_survey->rssi > -100 && chan_survey->rssi < 0)
++		survey->filled |= SURVEY_INFO_NOISE_DBM;
++
++	if (survey->channel == wcn->channel)
++		survey->filled |= SURVEY_INFO_IN_USE;
++
++	spin_unlock_irqrestore(&wcn->survey_lock, flags);
++
++	wcn36xx_dbg(WCN36XX_DBG_MAC,
++		    "ch %d rssi %d snr %d noise %d filled %x freq %d\n",
++		    HW_VALUE_CHANNEL(survey->channel->hw_value),
++		    chan_survey->rssi, chan_survey->snr, survey->noise,
++		    survey->filled, survey->channel->center_freq);
++
++	return 0;
++}
++
++static void wcn36xx_sta_statistics(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++				   struct ieee80211_sta *sta, struct station_info *sinfo)
++{
++	struct wcn36xx *wcn;
++	u8 sta_index;
++	int status;
++
++	wcn = hw->priv;
++	sta_index = get_sta_index(vif, wcn36xx_sta_to_priv(sta));
++	status = wcn36xx_smd_get_stats(wcn, sta_index, HAL_GLOBAL_CLASS_A_STATS_INFO, sinfo);
++
++	if (status)
++		wcn36xx_err("wcn36xx_smd_get_stats failed\n");
++}
++
+ static const struct ieee80211_ops wcn36xx_ops = {
+ 	.start			= wcn36xx_start,
+ 	.stop			= wcn36xx_stop,
+@@ -1182,6 +1355,7 @@
+ #ifdef CONFIG_PM
+ 	.suspend		= wcn36xx_suspend,
+ 	.resume			= wcn36xx_resume,
++	.set_rekey_data		= wcn36xx_set_rekey_data,
+ #endif
+ 	.config			= wcn36xx_config,
+ 	.prepare_multicast	= wcn36xx_prepare_multicast,
+@@ -1196,7 +1370,13 @@
+ 	.set_rts_threshold	= wcn36xx_set_rts_threshold,
+ 	.sta_add		= wcn36xx_sta_add,
+ 	.sta_remove		= wcn36xx_sta_remove,
++	.sta_statistics		= wcn36xx_sta_statistics,
+ 	.ampdu_action		= wcn36xx_ampdu_action,
++#if IS_ENABLED(CONFIG_IPV6)
++	.ipv6_addr_change	= wcn36xx_ipv6_addr_change,
++#endif
++	.flush			= wcn36xx_flush,
++	.get_survey		= wcn36xx_get_survey,
+ 
+ 	CFG80211_TESTMODE_CMD(wcn36xx_tm_cmd)
+ };
+@@ -1289,25 +1469,20 @@
+ {
+ 	struct device_node *mmio_node;
+ 	struct device_node *iris_node;
+-	struct resource *res;
+ 	int index;
+ 	int ret;
+ 
+ 	/* Set TX IRQ */
+-	res = platform_get_resource_byname(pdev, IORESOURCE_IRQ, "tx");
+-	if (!res) {
+-		wcn36xx_err("failed to get tx_irq\n");
+-		return -ENOENT;
+-	}
+-	wcn->tx_irq = res->start;
++	ret = platform_get_irq_byname(pdev, "tx");
++	if (ret < 0)
++		return ret;
++	wcn->tx_irq = ret;
+ 
+ 	/* Set RX IRQ */
+-	res = platform_get_resource_byname(pdev, IORESOURCE_IRQ, "rx");
+-	if (!res) {
+-		wcn36xx_err("failed to get rx_irq\n");
+-		return -ENOENT;
+-	}
+-	wcn->rx_irq = res->start;
++	ret = platform_get_irq_byname(pdev, "rx");
++	if (ret < 0)
++		return ret;
++	wcn->rx_irq = ret;
+ 
+ 	/* Acquire SMSM tx enable handle */
+ 	wcn->tx_enable_state = qcom_smem_state_get(&pdev->dev,
+@@ -1356,6 +1531,9 @@
+ 	if (iris_node) {
+ 		if (of_device_is_compatible(iris_node, "qcom,wcn3620"))
+ 			wcn->rf_id = RF_IRIS_WCN3620;
++		if (of_device_is_compatible(iris_node, "qcom,wcn3660") ||
++		    of_device_is_compatible(iris_node, "qcom,wcn3660b"))
++			wcn->rf_id = RF_IRIS_WCN3660;
+ 		if (of_device_is_compatible(iris_node, "qcom,wcn3680"))
+ 			wcn->rf_id = RF_IRIS_WCN3680;
+ 		of_node_put(iris_node);
+@@ -1378,6 +1556,7 @@
+ 	void *wcnss;
+ 	int ret;
+ 	const u8 *addr;
++	int n_channels;
+ 
+ 	wcn36xx_dbg(WCN36XX_DBG_MAC, "platform probe\n");
+ 
+@@ -1397,6 +1576,20 @@
+ 	mutex_init(&wcn->conf_mutex);
+ 	mutex_init(&wcn->hal_mutex);
+ 	mutex_init(&wcn->scan_lock);
++	__skb_queue_head_init(&wcn->amsdu);
++
++	wcn->hal_buf = devm_kmalloc(wcn->dev, WCN36XX_HAL_BUF_SIZE, GFP_KERNEL);
++	if (!wcn->hal_buf) {
++		ret = -ENOMEM;
++		goto out_wq;
++	}
++
++	n_channels = wcn_band_2ghz.n_channels + wcn_band_5ghz.n_channels;
++	wcn->chan_survey = devm_kmalloc(wcn->dev, n_channels, GFP_KERNEL);
++	if (!wcn->chan_survey) {
++		ret = -ENOMEM;
++		goto out_wq;
++	}
+ 
+ 	ret = dma_set_mask_and_coherent(wcn->dev, DMA_BIT_MASK(32));
+ 	if (ret < 0) {
+@@ -1404,6 +1597,13 @@
+ 		goto out_wq;
+ 	}
+ 
++	wcn->nv_file = WLAN_NV_FILE;
++	ret = of_property_read_string(wcn->dev->parent->of_node, "firmware-name", &wcn->nv_file);
++	if (ret < 0 && ret != -EINVAL) {
++		wcn36xx_err("failed to read \"firmware-name\" property: %d\n", ret);
++		goto out_wq;
++	}
++
+ 	wcn->smd_channel = qcom_wcnss_open_channel(wcnss, "WLAN_CTRL", wcn36xx_smd_rsp_process, hw);
+ 	if (IS_ERR(wcn->smd_channel)) {
+ 		wcn36xx_err("failed to open WLAN_CTRL channel\n");
+@@ -1461,6 +1661,8 @@
+ 	iounmap(wcn->dxe_base);
+ 	iounmap(wcn->ccu_base);
+ 
++	__skb_queue_purge(&wcn->amsdu);
++
+ 	mutex_destroy(&wcn->hal_mutex);
+ 	ieee80211_free_hw(hw);
+ 
+diff -Nur ./wcn36xx/Makefile ./wcn36xx_new/Makefile
+--- ./wcn36xx/Makefile	2022-12-05 20:37:37.138234800 +0800
++++ ./wcn36xx_new/Makefile	2022-12-05 20:37:04.053322800 +0800
+@@ -5,6 +5,7 @@
+                txrx.o \
+                smd.o \
+                pmc.o \
+-               debug.o
++               debug.o \
++               firmware.o
+ 
+ wcn36xx-$(CONFIG_NL80211_TESTMODE) += testmode.o
+diff -Nur ./wcn36xx/pmc.c ./wcn36xx_new/pmc.c
+--- ./wcn36xx/pmc.c	2022-12-05 20:37:37.086281300 +0800
++++ ./wcn36xx_new/pmc.c	2022-12-05 20:37:03.887376800 +0800
+@@ -18,19 +18,19 @@
+ 
+ #include "wcn36xx.h"
+ 
++#define WCN36XX_BMPS_FAIL_THREHOLD 3
++
+ int wcn36xx_pmc_enter_bmps_state(struct wcn36xx *wcn,
+ 				 struct ieee80211_vif *vif)
+ {
+ 	int ret = 0;
+ 	struct wcn36xx_vif *vif_priv = wcn36xx_vif_to_priv(vif);
+-
+-	if (!vif_priv->allow_bmps)
+-		return -ENOTSUPP;
+-
++	/* TODO: Make sure the TX chain clean */
+ 	ret = wcn36xx_smd_enter_bmps(wcn, vif);
+ 	if (!ret) {
+ 		wcn36xx_dbg(WCN36XX_DBG_PMC, "Entered BMPS\n");
+ 		vif_priv->pw_state = WCN36XX_BMPS;
++		vif_priv->bmps_fail_ct = 0;
+ 		vif->driver_flags |= IEEE80211_VIF_BEACON_FILTER;
+ 	} else {
+ 		/*
+@@ -39,6 +39,11 @@
+ 		 * received just after auth complete
+ 		 */
+ 		wcn36xx_err("Can not enter BMPS!\n");
++
++		if (vif_priv->bmps_fail_ct++ == WCN36XX_BMPS_FAIL_THREHOLD) {
++			ieee80211_connection_loss(vif);
++			vif_priv->bmps_fail_ct = 0;
++		}
+ 	}
+ 	return ret;
+ }
+diff -Nur ./wcn36xx/smd.c ./wcn36xx_new/smd.c
+--- ./wcn36xx/smd.c	2022-12-05 20:37:37.191202700 +0800
++++ ./wcn36xx_new/smd.c	2022-12-05 20:37:03.833555500 +0800
+@@ -16,11 +16,13 @@
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/bitfield.h>
+ #include <linux/etherdevice.h>
+ #include <linux/firmware.h>
+ #include <linux/bitops.h>
+ #include <linux/rpmsg.h>
+ #include "smd.h"
++#include "firmware.h"
+ 
+ struct wcn36xx_cfg_val {
+ 	u32 cfg_id;
+@@ -78,6 +80,7 @@
+ 	WCN36XX_CFG_VAL(MAX_ASSOC_LIMIT, 10),
+ 	WCN36XX_CFG_VAL(ENABLE_MCC_ADAPTIVE_SCHEDULER, 0),
+ 	WCN36XX_CFG_VAL(ENABLE_DYNAMIC_RA_START_RATE, 133), /* MCS 5 */
++	WCN36XX_CFG_VAL(LINK_FAIL_TX_CNT, 1000),
+ };
+ 
+ static struct wcn36xx_cfg_val wcn3680_cfg_vals[] = {
+@@ -162,7 +165,7 @@
+ 	WCN36XX_CFG_VAL(ENABLE_RTSCTS_HTVHT, 0),
+ 	WCN36XX_CFG_VAL(BTC_STATIC_OPP_WLAN_IDLE_WLAN_LEN, 30000),
+ 	WCN36XX_CFG_VAL(BTC_STATIC_OPP_WLAN_IDLE_BT_LEN, 120000),
+-	WCN36XX_CFG_VAL(LINK_FAIL_TX_CNT, 200),
++	WCN36XX_CFG_VAL(LINK_FAIL_TX_CNT, 1000),
+ 	WCN36XX_CFG_VAL(TOGGLE_ARP_BDRATES, 0),
+ 	WCN36XX_CFG_VAL(OPTIMIZE_CA_EVENT, 0),
+ 	WCN36XX_CFG_VAL(EXT_SCAN_CONC_MODE, 0),
+@@ -206,9 +209,9 @@
+ {
+ 	if (NL80211_BAND_5GHZ == WCN36XX_BAND(wcn))
+ 		bss_params->nw_type = WCN36XX_HAL_11A_NW_TYPE;
+-	else if (sta && sta->ht_cap.ht_supported)
++	else if (sta && sta->deflink.ht_cap.ht_supported)
+ 		bss_params->nw_type = WCN36XX_HAL_11N_NW_TYPE;
+-	else if (sta && (sta->supp_rates[NL80211_BAND_2GHZ] & 0x7f))
++	else if (sta && (sta->deflink.supp_rates[NL80211_BAND_2GHZ] & 0x7f))
+ 		bss_params->nw_type = WCN36XX_HAL_11G_NW_TYPE;
+ 	else
+ 		bss_params->nw_type = WCN36XX_HAL_11B_NW_TYPE;
+@@ -223,9 +226,10 @@
+ 		struct ieee80211_sta *sta,
+ 		struct wcn36xx_hal_config_bss_params *bss_params)
+ {
+-	if (sta && sta->ht_cap.ht_supported) {
+-		unsigned long caps = sta->ht_cap.cap;
+-		bss_params->ht = sta->ht_cap.ht_supported;
++	if (sta && sta->deflink.ht_cap.ht_supported) {
++		unsigned long caps = sta->deflink.ht_cap.cap;
++
++		bss_params->ht = sta->deflink.ht_cap.ht_supported;
+ 		bss_params->tx_channel_width_set = is_cap_supported(caps,
+ 			IEEE80211_HT_CAP_SUP_WIDTH_20_40);
+ 		bss_params->lsig_tx_op_protection_full_support =
+@@ -248,24 +252,26 @@
+ 			       struct ieee80211_sta *sta,
+ 			       struct wcn36xx_hal_config_bss_params_v1 *bss)
+ {
+-	if (sta && sta->vht_cap.vht_supported)
++	if (sta && sta->deflink.vht_cap.vht_supported)
+ 		bss->vht_capable = 1;
+ }
+ 
+ static void wcn36xx_smd_set_sta_ht_params(struct ieee80211_sta *sta,
+ 		struct wcn36xx_hal_config_sta_params *sta_params)
+ {
+-	if (sta->ht_cap.ht_supported) {
+-		unsigned long caps = sta->ht_cap.cap;
+-		sta_params->ht_capable = sta->ht_cap.ht_supported;
++	if (sta->deflink.ht_cap.ht_supported) {
++		unsigned long caps = sta->deflink.ht_cap.cap;
++
++		sta_params->ht_capable = sta->deflink.ht_cap.ht_supported;
+ 		sta_params->tx_channel_width_set = is_cap_supported(caps,
+ 			IEEE80211_HT_CAP_SUP_WIDTH_20_40);
+ 		sta_params->lsig_txop_protection = is_cap_supported(caps,
+ 			IEEE80211_HT_CAP_LSIG_TXOP_PROT);
+ 
+-		sta_params->max_ampdu_size = sta->ht_cap.ampdu_factor;
+-		sta_params->max_ampdu_density = sta->ht_cap.ampdu_density;
+-		sta_params->max_amsdu_size = is_cap_supported(caps,
++		sta_params->max_ampdu_size = sta->deflink.ht_cap.ampdu_factor;
++		sta_params->max_ampdu_density = sta->deflink.ht_cap.ampdu_density;
++		/* max_amsdu_size: 1 : 3839 bytes, 0 : 7935 bytes (max) */
++		sta_params->max_amsdu_size = !is_cap_supported(caps,
+ 			IEEE80211_HT_CAP_MAX_AMSDU);
+ 		sta_params->sgi_20Mhz = is_cap_supported(caps,
+ 			IEEE80211_HT_CAP_SGI_20);
+@@ -284,13 +290,13 @@
+ 		struct ieee80211_sta *sta,
+ 		struct wcn36xx_hal_config_sta_params_v1 *sta_params)
+ {
+-	if (sta->vht_cap.vht_supported) {
+-		unsigned long caps = sta->vht_cap.cap;
++	if (sta->deflink.vht_cap.vht_supported) {
++		unsigned long caps = sta->deflink.vht_cap.cap;
+ 
+-		sta_params->vht_capable = sta->vht_cap.vht_supported;
++		sta_params->vht_capable = sta->deflink.vht_cap.vht_supported;
+ 		sta_params->vht_ldpc_enabled =
+ 			is_cap_supported(caps, IEEE80211_VHT_CAP_RXLDPC);
+-		if (get_feat_caps(wcn->fw_feat_caps, MU_MIMO)) {
++		if (wcn36xx_firmware_get_feat_caps(wcn->fw_feat_caps, MU_MIMO)) {
+ 			sta_params->vht_tx_mu_beamformee_capable =
+ 				is_cap_supported(caps, IEEE80211_VHT_CAP_MU_BEAMFORMER_CAPABLE);
+ 			if (sta_params->vht_tx_mu_beamformee_capable)
+@@ -305,9 +311,10 @@
+ static void wcn36xx_smd_set_sta_ht_ldpc_params(struct ieee80211_sta *sta,
+ 		struct wcn36xx_hal_config_sta_params_v1 *sta_params)
+ {
+-	if (sta->ht_cap.ht_supported) {
++	if (sta->deflink.ht_cap.ht_supported) {
+ 		sta_params->ht_ldpc_enabled =
+-			is_cap_supported(sta->ht_cap.cap, IEEE80211_HT_CAP_LDPC_CODING);
++			is_cap_supported(sta->deflink.ht_cap.cap,
++					 IEEE80211_HT_CAP_LDPC_CODING);
+ 	}
+ }
+ 
+@@ -444,22 +451,12 @@
+ 	return ret;
+ }
+ 
+-static void init_hal_msg(struct wcn36xx_hal_msg_header *hdr,
+-			 enum wcn36xx_hal_host_msg_type msg_type,
+-			 size_t msg_size)
+-{
+-	memset(hdr, 0, msg_size + sizeof(*hdr));
+-	hdr->msg_type = msg_type;
+-	hdr->msg_version = WCN36XX_HAL_MSG_VERSION0;
+-	hdr->len = msg_size + sizeof(*hdr);
+-}
+-
+ #define __INIT_HAL_MSG(msg_body, type, version) \
+ 	do {								\
+-		memset(&msg_body, 0, sizeof(msg_body));			\
+-		msg_body.header.msg_type = type;			\
+-		msg_body.header.msg_version = version;			\
+-		msg_body.header.len = sizeof(msg_body);			\
++		memset(&(msg_body), 0, sizeof(msg_body));		\
++		(msg_body).header.msg_type = type;			\
++		(msg_body).header.msg_version = version;		\
++		(msg_body).header.len = sizeof(msg_body);		\
+ 	} while (0)							\
+ 
+ #define INIT_HAL_MSG(msg_body, type)	\
+@@ -484,7 +481,6 @@
+ 
+ #define PREPARE_HAL_PTT_MSG_BUF(send_buf, p_msg_body) \
+ 	do {							\
+-		memset(send_buf, 0, p_msg_body->header.len); \
+ 		memcpy(send_buf, p_msg_body, p_msg_body->header.len); \
+ 	} while (0)
+ 
+@@ -514,10 +510,10 @@
+ 	u16 fm_offset = 0;
+ 
+ 	if (!wcn->nv) {
+-		ret = request_firmware(&wcn->nv, WLAN_NV_FILE, wcn->dev);
++		ret = request_firmware(&wcn->nv, wcn->nv_file, wcn->dev);
+ 		if (ret) {
+ 			wcn36xx_err("Failed to load nv file %s: %d\n",
+-				      WLAN_NV_FILE, ret);
++				    wcn->nv_file, ret);
+ 			goto out;
+ 		}
+ 	}
+@@ -730,6 +726,7 @@
+ 		wcn36xx_err("hal_init_scan response failed err=%d\n", ret);
+ 		goto out;
+ 	}
++	wcn->sw_scan_init = true;
+ out:
+ 	mutex_unlock(&wcn->hal_mutex);
+ 	return ret;
+@@ -760,6 +757,7 @@
+ 		wcn36xx_err("hal_start_scan response failed err=%d\n", ret);
+ 		goto out;
+ 	}
++	wcn->sw_scan_channel = scan_channel;
+ out:
+ 	mutex_unlock(&wcn->hal_mutex);
+ 	return ret;
+@@ -790,6 +788,7 @@
+ 		wcn36xx_err("hal_end_scan response failed err=%d\n", ret);
+ 		goto out;
+ 	}
++	wcn->sw_scan_channel = 0;
+ out:
+ 	mutex_unlock(&wcn->hal_mutex);
+ 	return ret;
+@@ -831,6 +830,7 @@
+ 		wcn36xx_err("hal_finish_scan response failed err=%d\n", ret);
+ 		goto out;
+ 	}
++	wcn->sw_scan_init = false;
+ out:
+ 	mutex_unlock(&wcn->hal_mutex);
+ 	return ret;
+@@ -937,6 +937,86 @@
+ 	return ret;
+ }
+ 
++int wcn36xx_smd_update_channel_list(struct wcn36xx *wcn, struct cfg80211_scan_request *req)
++{
++	struct wcn36xx_hal_update_channel_list_req_msg *msg_body;
++	int ret, i;
++
++	msg_body = kzalloc(sizeof(*msg_body), GFP_KERNEL);
++	if (!msg_body)
++		return -ENOMEM;
++
++	INIT_HAL_MSG((*msg_body), WCN36XX_HAL_UPDATE_CHANNEL_LIST_REQ);
++
++	msg_body->num_channel = min_t(u8, req->n_channels, ARRAY_SIZE(msg_body->channels));
++	for (i = 0; i < msg_body->num_channel; i++) {
++		struct wcn36xx_hal_channel_param *param = &msg_body->channels[i];
++		u32 min_power = WCN36XX_HAL_DEFAULT_MIN_POWER;
++		u32 ant_gain = WCN36XX_HAL_DEFAULT_ANT_GAIN;
++
++		param->mhz = req->channels[i]->center_freq;
++		param->band_center_freq1 = req->channels[i]->center_freq;
++		param->band_center_freq2 = 0;
++
++		if (req->channels[i]->flags & IEEE80211_CHAN_NO_IR)
++			param->channel_info |= WCN36XX_HAL_CHAN_INFO_FLAG_PASSIVE;
++
++		if (req->channels[i]->flags & IEEE80211_CHAN_RADAR)
++			param->channel_info |= WCN36XX_HAL_CHAN_INFO_FLAG_DFS;
++
++		if (req->channels[i]->band == NL80211_BAND_5GHZ) {
++			param->channel_info |= WCN36XX_HAL_CHAN_INFO_FLAG_HT;
++			param->channel_info |= WCN36XX_HAL_CHAN_INFO_FLAG_VHT;
++			param->channel_info |= WCN36XX_HAL_CHAN_INFO_PHY_11A;
++		} else {
++			param->channel_info |= WCN36XX_HAL_CHAN_INFO_PHY_11BG;
++		}
++
++		if (min_power > req->channels[i]->max_power)
++			min_power = req->channels[i]->max_power;
++
++		if (req->channels[i]->max_antenna_gain)
++			ant_gain = req->channels[i]->max_antenna_gain;
++
++		u32p_replace_bits(&param->reg_info_1, min_power,
++				  WCN36XX_HAL_CHAN_REG1_MIN_PWR_MASK);
++		u32p_replace_bits(&param->reg_info_1, req->channels[i]->max_power,
++				  WCN36XX_HAL_CHAN_REG1_MAX_PWR_MASK);
++		u32p_replace_bits(&param->reg_info_1, req->channels[i]->max_reg_power,
++				  WCN36XX_HAL_CHAN_REG1_REG_PWR_MASK);
++		u32p_replace_bits(&param->reg_info_1, 0,
++				  WCN36XX_HAL_CHAN_REG1_CLASS_ID_MASK);
++		u32p_replace_bits(&param->reg_info_2, ant_gain,
++				  WCN36XX_HAL_CHAN_REG2_ANT_GAIN_MASK);
++
++		wcn36xx_dbg(WCN36XX_DBG_HAL,
++			    "%s: freq=%u, channel_info=%08x, reg_info1=%08x, reg_info2=%08x\n",
++			    __func__, param->mhz, param->channel_info, param->reg_info_1,
++			    param->reg_info_2);
++	}
++
++	mutex_lock(&wcn->hal_mutex);
++
++	PREPARE_HAL_BUF(wcn->hal_buf, (*msg_body));
++
++	ret = wcn36xx_smd_send_and_wait(wcn, msg_body->header.len);
++	if (ret) {
++		wcn36xx_err("Sending hal_update_channel_list failed\n");
++		goto out;
++	}
++
++	ret = wcn36xx_smd_rsp_status_check(wcn->hal_buf, wcn->hal_rsp_len);
++	if (ret) {
++		wcn36xx_err("hal_update_channel_list response failed err=%d\n", ret);
++		goto out;
++	}
++
++out:
++	kfree(msg_body);
++	mutex_unlock(&wcn->hal_mutex);
++	return ret;
++}
++
+ static int wcn36xx_smd_switch_channel_rsp(void *buf, size_t len)
+ {
+ 	struct wcn36xx_hal_switch_channel_rsp_msg *rsp;
+@@ -2175,6 +2255,7 @@
+ 	INIT_HAL_MSG(msg_body, WCN36XX_HAL_EXIT_BMPS_REQ);
+ 
+ 	msg_body.bss_index = vif_priv->bss_index;
++	msg_body.send_data_null = 1;
+ 
+ 	PREPARE_HAL_BUF(wcn->hal_buf, msg_body);
+ 
+@@ -2193,6 +2274,59 @@
+ 	return ret;
+ }
+ 
++int wcn36xx_smd_enter_imps(struct wcn36xx *wcn)
++{
++	struct wcn36xx_hal_enter_imps_req_msg msg_body;
++	int ret;
++
++	mutex_lock(&wcn->hal_mutex);
++	INIT_HAL_MSG(msg_body, WCN36XX_HAL_ENTER_IMPS_REQ);
++
++	PREPARE_HAL_BUF(wcn->hal_buf, msg_body);
++
++	ret = wcn36xx_smd_send_and_wait(wcn, msg_body.header.len);
++	if (ret) {
++		wcn36xx_err("Sending hal_enter_imps failed\n");
++		goto out;
++	}
++	ret = wcn36xx_smd_rsp_status_check(wcn->hal_buf, wcn->hal_rsp_len);
++	if (ret) {
++		wcn36xx_err("hal_enter_imps response failed err=%d\n", ret);
++		goto out;
++	}
++
++	wcn36xx_dbg(WCN36XX_DBG_HAL, "Entered idle mode\n");
++out:
++	mutex_unlock(&wcn->hal_mutex);
++	return ret;
++}
++
++int wcn36xx_smd_exit_imps(struct wcn36xx *wcn)
++{
++	struct wcn36xx_hal_exit_imps_req_msg msg_body;
++	int ret;
++
++	mutex_lock(&wcn->hal_mutex);
++	INIT_HAL_MSG(msg_body, WCN36XX_HAL_EXIT_IMPS_REQ);
++
++	PREPARE_HAL_BUF(wcn->hal_buf, msg_body);
++
++	ret = wcn36xx_smd_send_and_wait(wcn, msg_body.header.len);
++	if (ret) {
++		wcn36xx_err("Sending hal_exit_imps failed\n");
++		goto out;
++	}
++	ret = wcn36xx_smd_rsp_status_check(wcn->hal_buf, wcn->hal_rsp_len);
++	if (ret) {
++		wcn36xx_err("hal_exit_imps response failed err=%d\n", ret);
++		goto out;
++	}
++	wcn36xx_dbg(WCN36XX_DBG_HAL, "Exited idle mode\n");
++out:
++	mutex_unlock(&wcn->hal_mutex);
++	return ret;
++}
++
+ int wcn36xx_smd_set_power_params(struct wcn36xx *wcn, bool ignore_dtim)
+ {
+ 	struct wcn36xx_hal_set_power_params_req_msg msg_body;
+@@ -2298,49 +2432,6 @@
+ 	return ret;
+ }
+ 
+-void set_feat_caps(u32 *bitmap, enum place_holder_in_cap_bitmap cap)
+-{
+-	int arr_idx, bit_idx;
+-
+-	if (cap < 0 || cap > 127) {
+-		wcn36xx_warn("error cap idx %d\n", cap);
+-		return;
+-	}
+-
+-	arr_idx = cap / 32;
+-	bit_idx = cap % 32;
+-	bitmap[arr_idx] |= (1 << bit_idx);
+-}
+-
+-int get_feat_caps(u32 *bitmap, enum place_holder_in_cap_bitmap cap)
+-{
+-	int arr_idx, bit_idx;
+-
+-	if (cap < 0 || cap > 127) {
+-		wcn36xx_warn("error cap idx %d\n", cap);
+-		return -EINVAL;
+-	}
+-
+-	arr_idx = cap / 32;
+-	bit_idx = cap % 32;
+-
+-	return (bitmap[arr_idx] & (1 << bit_idx)) ? 1 : 0;
+-}
+-
+-void clear_feat_caps(u32 *bitmap, enum place_holder_in_cap_bitmap cap)
+-{
+-	int arr_idx, bit_idx;
+-
+-	if (cap < 0 || cap > 127) {
+-		wcn36xx_warn("error cap idx %d\n", cap);
+-		return;
+-	}
+-
+-	arr_idx = cap / 32;
+-	bit_idx = cap % 32;
+-	bitmap[arr_idx] &= ~(1 << bit_idx);
+-}
+-
+ int wcn36xx_smd_feature_caps_exchange(struct wcn36xx *wcn)
+ {
+ 	struct wcn36xx_hal_feat_caps_msg msg_body, *rsp;
+@@ -2349,9 +2440,13 @@
+ 	mutex_lock(&wcn->hal_mutex);
+ 	INIT_HAL_MSG(msg_body, WCN36XX_HAL_FEATURE_CAPS_EXCHANGE_REQ);
+ 
+-	set_feat_caps(msg_body.feat_caps, STA_POWERSAVE);
+-	if (wcn->rf_id == RF_IRIS_WCN3680)
+-		set_feat_caps(msg_body.feat_caps, DOT11AC);
++	wcn36xx_firmware_set_feat_caps(msg_body.feat_caps, STA_POWERSAVE);
++	if (wcn->rf_id == RF_IRIS_WCN3680) {
++		wcn36xx_firmware_set_feat_caps(msg_body.feat_caps, DOT11AC);
++		wcn36xx_firmware_set_feat_caps(msg_body.feat_caps, WLAN_CH144);
++		wcn36xx_firmware_set_feat_caps(msg_body.feat_caps,
++					       ANTENNA_DIVERSITY_SELECTION);
++	}
+ 
+ 	PREPARE_HAL_BUF(wcn->hal_buf, msg_body);
+ 
+@@ -2428,6 +2523,7 @@
+ 					     &session_id);
+ 	if (ret) {
+ 		wcn36xx_err("hal_add_ba_session response failed err=%d\n", ret);
++		ret = -EINVAL;
+ 		goto out;
+ 	}
+ 
+@@ -2465,7 +2561,7 @@
+ 	return ret;
+ }
+ 
+-int wcn36xx_smd_del_ba(struct wcn36xx *wcn, u16 tid, u8 sta_index)
++int wcn36xx_smd_del_ba(struct wcn36xx *wcn, u16 tid, u8 direction, u8 sta_index)
+ {
+ 	struct wcn36xx_hal_del_ba_req_msg msg_body;
+ 	int ret;
+@@ -2475,7 +2571,7 @@
+ 
+ 	msg_body.sta_index = sta_index;
+ 	msg_body.tid = tid;
+-	msg_body.direction = 0;
++	msg_body.direction = direction;
+ 	PREPARE_HAL_BUF(wcn->hal_buf, msg_body);
+ 
+ 	ret = wcn36xx_smd_send_and_wait(wcn, msg_body.header.len);
+@@ -2493,27 +2589,99 @@
+ 	return ret;
+ }
+ 
+-static int wcn36xx_smd_trigger_ba_rsp(void *buf, int len)
++int wcn36xx_smd_get_stats(struct wcn36xx *wcn, u8 sta_index, u32 stats_mask,
++			  struct station_info *sinfo)
+ {
++	struct wcn36xx_hal_stats_req_msg msg_body;
++	struct wcn36xx_hal_stats_rsp_msg *rsp;
++	void *rsp_body;
++	int ret;
++
++	if (stats_mask & ~HAL_GLOBAL_CLASS_A_STATS_INFO) {
++		wcn36xx_err("stats_mask 0x%x contains unimplemented types\n",
++			    stats_mask);
++		return -EINVAL;
++	}
++
++	mutex_lock(&wcn->hal_mutex);
++	INIT_HAL_MSG(msg_body, WCN36XX_HAL_GET_STATS_REQ);
++
++	msg_body.sta_id = sta_index;
++	msg_body.stats_mask = stats_mask;
++
++	PREPARE_HAL_BUF(wcn->hal_buf, msg_body);
++
++	ret = wcn36xx_smd_send_and_wait(wcn, msg_body.header.len);
++	if (ret) {
++		wcn36xx_err("sending hal_get_stats failed\n");
++		goto out;
++	}
++
++	ret = wcn36xx_smd_rsp_status_check(wcn->hal_buf, wcn->hal_rsp_len);
++	if (ret) {
++		wcn36xx_err("hal_get_stats response failed err=%d\n", ret);
++		goto out;
++	}
++
++	rsp = (struct wcn36xx_hal_stats_rsp_msg *)wcn->hal_buf;
++	rsp_body = (wcn->hal_buf + sizeof(struct wcn36xx_hal_stats_rsp_msg));
++
++	if (rsp->stats_mask != stats_mask) {
++		wcn36xx_err("stats_mask 0x%x differs from requested 0x%x\n",
++			    rsp->stats_mask, stats_mask);
++		goto out;
++	}
++
++	if (rsp->stats_mask & HAL_GLOBAL_CLASS_A_STATS_INFO) {
++		struct ani_global_class_a_stats_info *stats_info = rsp_body;
++
++		wcn36xx_process_tx_rate(stats_info, &sinfo->txrate);
++		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
++		rsp_body += sizeof(struct ani_global_class_a_stats_info);
++	}
++out:
++	mutex_unlock(&wcn->hal_mutex);
++
++	return ret;
++}
++
++static int wcn36xx_smd_trigger_ba_rsp(void *buf, int len, struct add_ba_info *ba_info)
++{
++	struct wcn36xx_hal_trigger_ba_rsp_candidate *candidate;
+ 	struct wcn36xx_hal_trigger_ba_rsp_msg *rsp;
++	int i;
+ 
+ 	if (len < sizeof(*rsp))
+ 		return -EINVAL;
+ 
+ 	rsp = (struct wcn36xx_hal_trigger_ba_rsp_msg *) buf;
++
++	if (rsp->candidate_cnt < 1)
++		return rsp->status ? rsp->status : -EINVAL;
++
++	candidate = (struct wcn36xx_hal_trigger_ba_rsp_candidate *)(buf + sizeof(*rsp));
++
++	for (i = 0; i < STACFG_MAX_TC; i++) {
++		ba_info[i] = candidate->ba_info[i];
++	}
++
+ 	return rsp->status;
+ }
+ 
+-int wcn36xx_smd_trigger_ba(struct wcn36xx *wcn, u8 sta_index, u16 tid, u8 session_id)
++int wcn36xx_smd_trigger_ba(struct wcn36xx *wcn, u8 sta_index, u16 tid, u16 *ssn)
+ {
+ 	struct wcn36xx_hal_trigger_ba_req_msg msg_body;
+ 	struct wcn36xx_hal_trigger_ba_req_candidate *candidate;
++	struct add_ba_info ba_info[STACFG_MAX_TC];
+ 	int ret;
+ 
++	if (tid >= STACFG_MAX_TC)
++		return -EINVAL;
++
+ 	mutex_lock(&wcn->hal_mutex);
+ 	INIT_HAL_MSG(msg_body, WCN36XX_HAL_TRIGGER_BA_REQ);
+ 
+-	msg_body.session_id = session_id;
++	msg_body.session_id = 0; /* not really used */
+ 	msg_body.candidate_cnt = 1;
+ 	msg_body.header.len += sizeof(*candidate);
+ 	PREPARE_HAL_BUF(wcn->hal_buf, msg_body);
+@@ -2528,13 +2696,17 @@
+ 		wcn36xx_err("Sending hal_trigger_ba failed\n");
+ 		goto out;
+ 	}
+-	ret = wcn36xx_smd_trigger_ba_rsp(wcn->hal_buf, wcn->hal_rsp_len);
++	ret = wcn36xx_smd_trigger_ba_rsp(wcn->hal_buf, wcn->hal_rsp_len, ba_info);
+ 	if (ret) {
+ 		wcn36xx_err("hal_trigger_ba response failed err=%d\n", ret);
+ 		goto out;
+ 	}
+ out:
+ 	mutex_unlock(&wcn->hal_mutex);
++
++	if (ssn)
++		*ssn = ba_info[tid].starting_seq_num;
++
+ 	return ret;
+ }
+ 
+@@ -2568,7 +2740,7 @@
+ 	case WCN36XX_HAL_SCAN_IND_FAILED:
+ 	case WCN36XX_HAL_SCAN_IND_DEQUEUED:
+ 		scan_info.aborted = true;
+-		/* fall through */
++		fallthrough;
+ 	case WCN36XX_HAL_SCAN_IND_COMPLETED:
+ 		mutex_lock(&wcn->scan_lock);
+ 		wcn->scan_req = NULL;
+@@ -2603,7 +2775,7 @@
+ 			wcn36xx_dbg(WCN36XX_DBG_HAL, "beacon missed bss_index %d\n",
+ 				    tmp->bss_index);
+ 			vif = wcn36xx_priv_to_vif(tmp);
+-			ieee80211_connection_loss(vif);
++			ieee80211_beacon_loss(vif);
+ 		}
+ 		return 0;
+ 	}
+@@ -2618,7 +2790,7 @@
+ 			wcn36xx_dbg(WCN36XX_DBG_HAL, "beacon missed bss_index %d\n",
+ 				    rsp->bss_index);
+ 			vif = wcn36xx_priv_to_vif(tmp);
+-			ieee80211_connection_loss(vif);
++			ieee80211_beacon_loss(vif);
+ 			return 0;
+ 		}
+ 	}
+@@ -2632,30 +2804,52 @@
+ 					      size_t len)
+ {
+ 	struct wcn36xx_hal_delete_sta_context_ind_msg *rsp = buf;
+-	struct wcn36xx_vif *tmp;
++	struct wcn36xx_vif *vif_priv;
++	struct ieee80211_vif *vif;
++	struct ieee80211_bss_conf *bss_conf;
+ 	struct ieee80211_sta *sta;
++	bool found = false;
+ 
+ 	if (len != sizeof(*rsp)) {
+ 		wcn36xx_warn("Corrupted delete sta indication\n");
+ 		return -EIO;
+ 	}
+ 
+-	wcn36xx_dbg(WCN36XX_DBG_HAL, "delete station indication %pM index %d\n",
+-		    rsp->addr2, rsp->sta_id);
++	wcn36xx_dbg(WCN36XX_DBG_HAL,
++		    "delete station indication %pM index %d reason %d\n",
++		    rsp->addr2, rsp->sta_id, rsp->reason_code);
+ 
+-	list_for_each_entry(tmp, &wcn->vif_list, list) {
++	list_for_each_entry(vif_priv, &wcn->vif_list, list) {
+ 		rcu_read_lock();
+-		sta = ieee80211_find_sta(wcn36xx_priv_to_vif(tmp), rsp->addr2);
+-		if (sta)
+-			ieee80211_report_low_ack(sta, 0);
++		vif = wcn36xx_priv_to_vif(vif_priv);
++
++		if (vif->type == NL80211_IFTYPE_STATION) {
++			/* We could call ieee80211_find_sta too, but checking
++			 * bss_conf is clearer.
++			 */
++			bss_conf = &vif->bss_conf;
++			if (vif_priv->sta_assoc &&
++			    !memcmp(bss_conf->bssid, rsp->addr2, ETH_ALEN)) {
++				found = true;
++				wcn36xx_dbg(WCN36XX_DBG_HAL,
++					    "connection loss bss_index %d\n",
++					    vif_priv->bss_index);
++				ieee80211_connection_loss(vif);
++			}
++		} else {
++			sta = ieee80211_find_sta(vif, rsp->addr2);
++			if (sta) {
++				found = true;
++				ieee80211_report_low_ack(sta, 0);
++			}
++		}
++
+ 		rcu_read_unlock();
+-		if (sta)
++		if (found)
+ 			return 0;
+ 	}
+ 
+-	wcn36xx_warn("STA with addr %pM and index %d not found\n",
+-		     rsp->addr2,
+-		     rsp->sta_id);
++	wcn36xx_warn("BSS or STA with addr %pM not found\n", rsp->addr2);
+ 	return -ENOENT;
+ }
+ 
+@@ -2728,8 +2922,7 @@
+ 
+ 	msg_body = (struct wcn36xx_hal_rcv_flt_pkt_set_mc_list_req_msg *)
+ 		   wcn->hal_buf;
+-	init_hal_msg(&msg_body->header, WCN36XX_HAL_8023_MULTICAST_LIST_REQ,
+-		     sizeof(msg_body->mc_addr_list));
++	INIT_HAL_MSG(*msg_body, WCN36XX_HAL_8023_MULTICAST_LIST_REQ);
+ 
+ 	/* An empty list means all mc traffic will be received */
+ 	if (fp)
+@@ -2755,6 +2948,354 @@
+ 	return ret;
+ }
+ 
++int wcn36xx_smd_arp_offload(struct wcn36xx *wcn, struct ieee80211_vif *vif,
++			    bool enable)
++{
++	struct wcn36xx_vif *vif_priv = wcn36xx_vif_to_priv(vif);
++	struct wcn36xx_hal_host_offload_req_msg msg_body;
++	int ret;
++
++	mutex_lock(&wcn->hal_mutex);
++
++	INIT_HAL_MSG(msg_body, WCN36XX_HAL_HOST_OFFLOAD_REQ);
++	msg_body.host_offload_params.offload_type =
++		WCN36XX_HAL_IPV4_ARP_REPLY_OFFLOAD;
++	if (enable) {
++		msg_body.host_offload_params.enable =
++			WCN36XX_HAL_OFFLOAD_ARP_AND_BCAST_FILTER_ENABLE;
++		memcpy(&msg_body.host_offload_params.u,
++		       &vif->cfg.arp_addr_list[0], sizeof(__be32));
++	}
++	msg_body.ns_offload_params.bss_index = vif_priv->bss_index;
++
++	PREPARE_HAL_BUF(wcn->hal_buf, msg_body);
++
++	ret = wcn36xx_smd_send_and_wait(wcn, msg_body.header.len);
++	if (ret) {
++		wcn36xx_err("Sending host_offload_arp failed\n");
++		goto out;
++	}
++	ret = wcn36xx_smd_rsp_status_check(wcn->hal_buf, wcn->hal_rsp_len);
++	if (ret) {
++		wcn36xx_err("host_offload_arp failed err=%d\n", ret);
++		goto out;
++	}
++out:
++	mutex_unlock(&wcn->hal_mutex);
++	return ret;
++}
++
++#if IS_ENABLED(CONFIG_IPV6)
++int wcn36xx_smd_ipv6_ns_offload(struct wcn36xx *wcn, struct ieee80211_vif *vif,
++				bool enable)
++{
++	struct wcn36xx_vif *vif_priv = wcn36xx_vif_to_priv(vif);
++	struct wcn36xx_hal_host_offload_req_msg msg_body;
++	struct wcn36xx_hal_ns_offload_params *ns_params;
++	struct wcn36xx_hal_host_offload_req *ho_params;
++	int ret;
++
++	mutex_lock(&wcn->hal_mutex);
++
++	INIT_HAL_MSG(msg_body, WCN36XX_HAL_HOST_OFFLOAD_REQ);
++	ho_params = &msg_body.host_offload_params;
++	ns_params = &msg_body.ns_offload_params;
++
++	ho_params->offload_type = WCN36XX_HAL_IPV6_NS_OFFLOAD;
++	if (enable) {
++		ho_params->enable =
++			WCN36XX_HAL_OFFLOAD_NS_AND_MCAST_FILTER_ENABLE;
++		if (vif_priv->num_target_ipv6_addrs) {
++			memcpy(&ho_params->u,
++			       &vif_priv->target_ipv6_addrs[0].in6_u,
++			       sizeof(struct in6_addr));
++			memcpy(&ns_params->target_ipv6_addr1,
++			       &vif_priv->target_ipv6_addrs[0].in6_u,
++			       sizeof(struct in6_addr));
++			ns_params->target_ipv6_addr1_valid = 1;
++		}
++		if (vif_priv->num_target_ipv6_addrs > 1) {
++			memcpy(&ns_params->target_ipv6_addr2,
++			       &vif_priv->target_ipv6_addrs[1].in6_u,
++			       sizeof(struct in6_addr));
++			ns_params->target_ipv6_addr2_valid = 1;
++		}
++	}
++	memcpy(&ns_params->self_addr, vif->addr, ETH_ALEN);
++	ns_params->bss_index = vif_priv->bss_index;
++
++	PREPARE_HAL_BUF(wcn->hal_buf, msg_body);
++
++	ret = wcn36xx_smd_send_and_wait(wcn, msg_body.header.len);
++	if (ret) {
++		wcn36xx_err("Sending host_offload_arp failed\n");
++		goto out;
++	}
++	ret = wcn36xx_smd_rsp_status_check(wcn->hal_buf, wcn->hal_rsp_len);
++	if (ret) {
++		wcn36xx_err("host_offload_arp failed err=%d\n", ret);
++		goto out;
++	}
++out:
++	mutex_unlock(&wcn->hal_mutex);
++	return ret;
++}
++#else
++int wcn36xx_smd_ipv6_ns_offload(struct wcn36xx *wcn, struct ieee80211_vif *vif,
++				bool enable)
++{
++	return 0;
++}
++#endif
++
++int wcn36xx_smd_gtk_offload(struct wcn36xx *wcn, struct ieee80211_vif *vif,
++			    bool enable)
++{
++	struct wcn36xx_vif *vif_priv = wcn36xx_vif_to_priv(vif);
++	struct wcn36xx_hal_gtk_offload_req_msg msg_body;
++	int ret;
++
++	mutex_lock(&wcn->hal_mutex);
++
++	INIT_HAL_MSG(msg_body, WCN36XX_HAL_GTK_OFFLOAD_REQ);
++
++	if (enable) {
++		memcpy(&msg_body.kek, vif_priv->rekey_data.kek, NL80211_KEK_LEN);
++		memcpy(&msg_body.kck, vif_priv->rekey_data.kck, NL80211_KCK_LEN);
++		msg_body.key_replay_counter =
++			le64_to_cpu(vif_priv->rekey_data.replay_ctr);
++		msg_body.bss_index = vif_priv->bss_index;
++	} else {
++		msg_body.flags = WCN36XX_HAL_GTK_OFFLOAD_FLAGS_DISABLE;
++	}
++
++	PREPARE_HAL_BUF(wcn->hal_buf, msg_body);
++
++	ret = wcn36xx_smd_send_and_wait(wcn, msg_body.header.len);
++	if (ret) {
++		wcn36xx_err("Sending host_offload_arp failed\n");
++		goto out;
++	}
++	ret = wcn36xx_smd_rsp_status_check(wcn->hal_buf, wcn->hal_rsp_len);
++	if (ret) {
++		wcn36xx_err("host_offload_arp failed err=%d\n", ret);
++		goto out;
++	}
++out:
++	mutex_unlock(&wcn->hal_mutex);
++	return ret;
++}
++
++static int wcn36xx_smd_gtk_offload_get_info_rsp(struct wcn36xx *wcn,
++						struct ieee80211_vif *vif)
++{
++	struct wcn36xx_vif *vif_priv = wcn36xx_vif_to_priv(vif);
++	struct wcn36xx_hal_gtk_offload_get_info_rsp_msg *rsp;
++	__be64 replay_ctr;
++
++	if (wcn36xx_smd_rsp_status_check(wcn->hal_buf, wcn->hal_rsp_len))
++		return -EIO;
++
++	rsp = (struct wcn36xx_hal_gtk_offload_get_info_rsp_msg *)wcn->hal_buf;
++
++	if (rsp->bss_index != vif_priv->bss_index) {
++		wcn36xx_err("gtk_offload_info invalid response bss index %d\n",
++			    rsp->bss_index);
++		return -ENOENT;
++	}
++
++	if (vif_priv->rekey_data.replay_ctr != cpu_to_le64(rsp->key_replay_counter)) {
++		replay_ctr = cpu_to_be64(rsp->key_replay_counter);
++		vif_priv->rekey_data.replay_ctr =
++			cpu_to_le64(rsp->key_replay_counter);
++		ieee80211_gtk_rekey_notify(vif, vif->bss_conf.bssid,
++					   (void *)&replay_ctr, GFP_KERNEL);
++		wcn36xx_dbg(WCN36XX_DBG_HAL,
++			    "GTK replay counter increment %llu\n",
++			    rsp->key_replay_counter);
++	}
++
++	wcn36xx_dbg(WCN36XX_DBG_HAL,
++		    "gtk offload info status %d last_rekey_status %d "
++		    "replay_counter %llu total_rekey_count %d gtk_rekey_count %d "
++		    "igtk_rekey_count %d bss_index %d\n",
++		    rsp->status, rsp->last_rekey_status,
++		    rsp->key_replay_counter, rsp->total_rekey_count,
++		    rsp->gtk_rekey_count, rsp->igtk_rekey_count,
++		    rsp->bss_index);
++
++	return 0;
++}
++
++int wcn36xx_smd_gtk_offload_get_info(struct wcn36xx *wcn,
++				     struct ieee80211_vif *vif)
++{
++	struct wcn36xx_vif *vif_priv = wcn36xx_vif_to_priv(vif);
++	struct wcn36xx_hal_gtk_offload_get_info_req_msg msg_body;
++	int ret;
++
++	mutex_lock(&wcn->hal_mutex);
++
++	INIT_HAL_MSG(msg_body, WCN36XX_HAL_GTK_OFFLOAD_GETINFO_REQ);
++
++	msg_body.bss_index = vif_priv->bss_index;
++
++	PREPARE_HAL_BUF(wcn->hal_buf, msg_body);
++
++	ret = wcn36xx_smd_send_and_wait(wcn, msg_body.header.len);
++	if (ret) {
++		wcn36xx_err("Sending gtk_offload_get_info failed\n");
++		goto out;
++	}
++	ret = wcn36xx_smd_rsp_status_check(wcn->hal_buf, wcn->hal_rsp_len);
++	if (ret) {
++		wcn36xx_err("gtk_offload_get_info failed err=%d\n", ret);
++		goto out;
++	}
++	ret = wcn36xx_smd_gtk_offload_get_info_rsp(wcn, vif);
++out:
++	mutex_unlock(&wcn->hal_mutex);
++	return ret;
++}
++
++int wcn36xx_smd_wlan_host_suspend_ind(struct wcn36xx *wcn)
++{
++	struct wcn36xx_hal_wlan_host_suspend_ind_msg msg_body;
++	int ret;
++
++	mutex_lock(&wcn->hal_mutex);
++
++	INIT_HAL_MSG(msg_body, WCN36XX_HAL_HOST_SUSPEND_IND);
++	msg_body.configured_mcst_bcst_filter_setting = 0;
++	msg_body.active_session_count = 1;
++	PREPARE_HAL_BUF(wcn->hal_buf, msg_body);
++
++	ret = rpmsg_send(wcn->smd_channel, wcn->hal_buf, msg_body.header.len);
++
++	mutex_unlock(&wcn->hal_mutex);
++
++	return ret;
++}
++
++int wcn36xx_smd_host_resume(struct wcn36xx *wcn)
++{
++	struct wcn36xx_hal_wlan_host_resume_req_msg msg_body;
++	struct wcn36xx_hal_host_resume_rsp_msg *rsp;
++	int ret;
++
++	mutex_lock(&wcn->hal_mutex);
++
++	INIT_HAL_MSG(msg_body, WCN36XX_HAL_HOST_RESUME_REQ);
++	msg_body.configured_mcst_bcst_filter_setting = 0;
++
++	PREPARE_HAL_BUF(wcn->hal_buf, msg_body);
++
++	ret = wcn36xx_smd_send_and_wait(wcn, msg_body.header.len);
++	if (ret) {
++		wcn36xx_err("Sending wlan_host_resume failed\n");
++		goto out;
++	}
++	ret = wcn36xx_smd_rsp_status_check(wcn->hal_buf, wcn->hal_rsp_len);
++	if (ret) {
++		wcn36xx_err("wlan_host_resume err=%d\n", ret);
++		goto out;
++	}
++
++	rsp = (struct wcn36xx_hal_host_resume_rsp_msg *)wcn->hal_buf;
++	if (rsp->status)
++		wcn36xx_warn("wlan_host_resume status=%d\n", rsp->status);
++
++out:
++	mutex_unlock(&wcn->hal_mutex);
++
++	return ret;
++}
++
++#define BEACON_FILTER(eid, presence, offs, val, mask, ref_val) \
++	{					\
++		.element_id = eid,		\
++		.check_ie_presence = presence,	\
++		.offset = offs,			\
++		.value = val,			\
++		.bitmask = mask,		\
++		.ref = ref_val,			\
++	}
++
++static const struct beacon_filter_ie bcn_filter_ies[] = {
++	BEACON_FILTER(WLAN_EID_DS_PARAMS, 0, 0, 0,
++		      WCN36XX_FILTER_IE_DS_CHANNEL_MASK, 0),
++	BEACON_FILTER(WLAN_EID_ERP_INFO, 0, 0, 0,
++		      WCN36XX_FILTER_IE_ERP_FILTER_MASK, 0),
++	BEACON_FILTER(WLAN_EID_EDCA_PARAM_SET, 0, 0, 0,
++		      WCN36XX_FILTER_IE_EDCA_FILTER_MASK, 0),
++	BEACON_FILTER(WLAN_EID_QOS_CAPA, 0, 0, 0,
++		      WCN36XX_FILTER_IE_QOS_FILTER_MASK, 0),
++	BEACON_FILTER(WLAN_EID_CHANNEL_SWITCH, 1, 0, 0,
++		      WCN36XX_FILTER_IE_CHANNEL_SWITCH_MASK, 0),
++	BEACON_FILTER(WLAN_EID_HT_OPERATION, 0, 0, 0,
++		      WCN36XX_FILTER_IE_HT_BYTE0_FILTER_MASK, 0),
++	BEACON_FILTER(WLAN_EID_HT_OPERATION, 0, 2, 0,
++		      WCN36XX_FILTER_IE_HT_BYTE2_FILTER_MASK, 0),
++	BEACON_FILTER(WLAN_EID_HT_OPERATION, 0, 5, 0,
++		      WCN36XX_FILTER_IE_HT_BYTE5_FILTER_MASK, 0),
++	BEACON_FILTER(WLAN_EID_PWR_CONSTRAINT, 0, 0, 0,
++		      WCN36XX_FILTER_IE_PWR_CONSTRAINT_MASK, 0),
++	BEACON_FILTER(WLAN_EID_OPMODE_NOTIF, 0, 0, 0,
++		      WCN36XX_FILTER_IE_OPMODE_NOTIF_MASK, 0),
++	BEACON_FILTER(WLAN_EID_VHT_OPERATION, 0, 0, 0,
++		      WCN36XX_FILTER_IE_VHTOP_CHWIDTH_MASK, 0),
++	BEACON_FILTER(WLAN_EID_RSN, 1, 0, 0,
++		      WCN36XX_FILTER_IE_RSN_MASK, 0),
++	BEACON_FILTER(WLAN_EID_VENDOR_SPECIFIC, 1, 0, 0,
++		      WCN36XX_FILTER_IE_VENDOR_MASK, 0),
++};
++
++int wcn36xx_smd_add_beacon_filter(struct wcn36xx *wcn,
++				  struct ieee80211_vif *vif)
++{
++	struct wcn36xx_hal_add_bcn_filter_req_msg msg_body, *body;
++	struct wcn36xx_vif *vif_priv = wcn36xx_vif_to_priv(vif);
++	u8 *payload;
++	size_t payload_size;
++	int ret;
++
++	if (!wcn36xx_firmware_get_feat_caps(wcn->fw_feat_caps, BCN_FILTER))
++		return -EOPNOTSUPP;
++
++	mutex_lock(&wcn->hal_mutex);
++	INIT_HAL_MSG(msg_body, WCN36XX_HAL_ADD_BCN_FILTER_REQ);
++
++	PREPARE_HAL_BUF(wcn->hal_buf, msg_body);
++
++	body = (struct wcn36xx_hal_add_bcn_filter_req_msg *)wcn->hal_buf;
++	body->capability_info = vif->bss_conf.assoc_capability;
++	body->capability_mask = WCN36XX_FILTER_CAPABILITY_MASK;
++	body->beacon_interval = vif->bss_conf.beacon_int;
++	body->ie_num = ARRAY_SIZE(bcn_filter_ies);
++	body->bss_index = vif_priv->bss_index;
++
++	payload = ((u8 *)body) + body->header.len;
++	payload_size = sizeof(bcn_filter_ies);
++	memcpy(payload, &bcn_filter_ies, payload_size);
++
++	body->header.len += payload_size;
++
++	ret = wcn36xx_smd_send_and_wait(wcn, body->header.len);
++	if (ret) {
++		wcn36xx_err("Sending add bcn_filter failed\n");
++		goto out;
++	}
++
++	ret = wcn36xx_smd_rsp_status_check(wcn->hal_buf, wcn->hal_rsp_len);
++	if (ret) {
++		wcn36xx_err("add bcn filter response failed err=%d\n", ret);
++		goto out;
++	}
++out:
++	mutex_unlock(&wcn->hal_mutex);
++	return ret;
++}
++
+ int wcn36xx_smd_rsp_process(struct rpmsg_device *rpdev,
+ 			    void *buf, int len, void *priv, u32 addr)
+ {
+@@ -2793,6 +3334,7 @@
+ 	case WCN36XX_HAL_ADD_BA_SESSION_RSP:
+ 	case WCN36XX_HAL_ADD_BA_RSP:
+ 	case WCN36XX_HAL_DEL_BA_RSP:
++	case WCN36XX_HAL_GET_STATS_RSP:
+ 	case WCN36XX_HAL_TRIGGER_BA_RSP:
+ 	case WCN36XX_HAL_UPDATE_CFG_RSP:
+ 	case WCN36XX_HAL_JOIN_RSP:
+@@ -2803,6 +3345,14 @@
+ 	case WCN36XX_HAL_8023_MULTICAST_LIST_RSP:
+ 	case WCN36XX_HAL_START_SCAN_OFFLOAD_RSP:
+ 	case WCN36XX_HAL_STOP_SCAN_OFFLOAD_RSP:
++	case WCN36XX_HAL_HOST_OFFLOAD_RSP:
++	case WCN36XX_HAL_GTK_OFFLOAD_RSP:
++	case WCN36XX_HAL_GTK_OFFLOAD_GETINFO_RSP:
++	case WCN36XX_HAL_HOST_RESUME_RSP:
++	case WCN36XX_HAL_ENTER_IMPS_RSP:
++	case WCN36XX_HAL_EXIT_IMPS_RSP:
++	case WCN36XX_HAL_UPDATE_CHANNEL_LIST_RSP:
++	case WCN36XX_HAL_ADD_BCN_FILTER_RSP:
+ 		memcpy(wcn->hal_buf, buf, len);
+ 		wcn->hal_rsp_len = len;
+ 		complete(&wcn->hal_rsp_compl);
+@@ -2816,7 +3366,7 @@
+ 	case WCN36XX_HAL_DELETE_STA_CONTEXT_IND:
+ 	case WCN36XX_HAL_PRINT_REG_INFO_IND:
+ 	case WCN36XX_HAL_SCAN_OFFLOAD_IND:
+-		msg_ind = kmalloc(sizeof(*msg_ind) + len, GFP_ATOMIC);
++		msg_ind = kmalloc(struct_size(msg_ind, msg, len), GFP_ATOMIC);
+ 		if (!msg_ind) {
+ 			wcn36xx_err("Run out of memory while handling SMD_EVENT (%d)\n",
+ 				    msg_header->msg_type);
+diff -Nur ./wcn36xx/smd.h ./wcn36xx_new/smd.h
+--- ./wcn36xx/smd.h	2022-12-05 20:37:37.052296300 +0800
++++ ./wcn36xx_new/smd.h	2022-12-05 20:37:03.924112400 +0800
+@@ -70,6 +70,7 @@
+ int wcn36xx_smd_start_hw_scan(struct wcn36xx *wcn, struct ieee80211_vif *vif,
+ 			      struct cfg80211_scan_request *req);
+ int wcn36xx_smd_stop_hw_scan(struct wcn36xx *wcn);
++int wcn36xx_smd_update_channel_list(struct wcn36xx *wcn, struct cfg80211_scan_request *req);
+ int wcn36xx_smd_add_sta_self(struct wcn36xx *wcn, struct ieee80211_vif *vif);
+ int wcn36xx_smd_delete_sta_self(struct wcn36xx *wcn, u8 *addr);
+ int wcn36xx_smd_delete_sta(struct wcn36xx *wcn, u8 sta_index);
+@@ -124,9 +125,6 @@
+ int wcn36xx_smd_dump_cmd_req(struct wcn36xx *wcn, u32 arg1, u32 arg2,
+ 			     u32 arg3, u32 arg4, u32 arg5);
+ int wcn36xx_smd_feature_caps_exchange(struct wcn36xx *wcn);
+-void set_feat_caps(u32 *bitmap, enum place_holder_in_cap_bitmap cap);
+-int get_feat_caps(u32 *bitmap, enum place_holder_in_cap_bitmap cap);
+-void clear_feat_caps(u32 *bitmap, enum place_holder_in_cap_bitmap cap);
+ 
+ int wcn36xx_smd_add_ba_session(struct wcn36xx *wcn,
+ 		struct ieee80211_sta *sta,
+@@ -135,8 +133,10 @@
+ 		u8 direction,
+ 		u8 sta_index);
+ int wcn36xx_smd_add_ba(struct wcn36xx *wcn, u8 session_id);
+-int wcn36xx_smd_del_ba(struct wcn36xx *wcn, u16 tid, u8 sta_index);
+-int wcn36xx_smd_trigger_ba(struct wcn36xx *wcn, u8 sta_index, u16 tid, u8 session_id);
++int wcn36xx_smd_del_ba(struct wcn36xx *wcn, u16 tid, u8 direction, u8 sta_index);
++int wcn36xx_smd_trigger_ba(struct wcn36xx *wcn, u8 sta_index, u16 tid, u16 *ssn);
++int wcn36xx_smd_get_stats(struct wcn36xx *wcn, u8 sta_index, u32 stats_mask,
++			  struct station_info *sinfo);
+ 
+ int wcn36xx_smd_update_cfg(struct wcn36xx *wcn, u32 cfg_id, u32 value);
+ 
+@@ -146,4 +146,27 @@
+ int wcn36xx_smd_set_mc_list(struct wcn36xx *wcn,
+ 			    struct ieee80211_vif *vif,
+ 			    struct wcn36xx_hal_rcv_flt_mc_addr_list_type *fp);
++
++int wcn36xx_smd_arp_offload(struct wcn36xx *wcn, struct ieee80211_vif *vif,
++			    bool enable);
++
++int wcn36xx_smd_ipv6_ns_offload(struct wcn36xx *wcn, struct ieee80211_vif *vif,
++				bool enable);
++
++int wcn36xx_smd_gtk_offload(struct wcn36xx *wcn, struct ieee80211_vif *vif,
++			    bool enable);
++
++int wcn36xx_smd_gtk_offload_get_info(struct wcn36xx *wcn,
++				     struct ieee80211_vif *vif);
++
++int wcn36xx_smd_wlan_host_suspend_ind(struct wcn36xx *wcn);
++
++int wcn36xx_smd_host_resume(struct wcn36xx *wcn);
++
++int wcn36xx_smd_enter_imps(struct wcn36xx *wcn);
++int wcn36xx_smd_exit_imps(struct wcn36xx *wcn);
++
++int wcn36xx_smd_add_beacon_filter(struct wcn36xx *wcn,
++				  struct ieee80211_vif *vif);
++
+ #endif	/* _SMD_H_ */
+diff -Nur ./wcn36xx/txrx.c ./wcn36xx_new/txrx.c
+--- ./wcn36xx/txrx.c	2022-12-05 20:37:37.033295900 +0800
++++ ./wcn36xx_new/txrx.c	2022-12-05 20:37:04.034331500 +0800
+@@ -16,6 +16,7 @@
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/random.h>
+ #include "txrx.h"
+ 
+ static inline int get_rssi0(struct wcn36xx_rx_bd *bd)
+@@ -23,6 +24,11 @@
+ 	return 100 - ((bd->phy_stat0 >> 24) & 0xff);
+ }
+ 
++static inline int get_snr(struct wcn36xx_rx_bd *bd)
++{
++	return ((bd->phy_stat1 >> 24) & 0xff);
++}
++
+ struct wcn36xx_rate {
+ 	u16 bitrate;
+ 	u16 mcs_or_legacy_index;
+@@ -31,6 +37,13 @@
+ 	enum rate_info_bw bw;
+ };
+ 
++/* Buffer descriptor rx_ch field is limited to 5-bit (4+1), a mapping is used
++ * for 11A Channels.
++ */
++static const u8 ab_rx_ch_map[] = { 36, 40, 44, 48, 52, 56, 60, 64, 100, 104,
++				   108, 112, 116, 120, 124, 128, 132, 136, 140,
++				   149, 153, 157, 161, 165, 144 };
++
+ static const struct wcn36xx_rate wcn36xx_rate_table[] = {
+ 	/* 11b rates */
+ 	{  10, 0, RX_ENC_LEGACY, 0, RATE_INFO_BW_20 },
+@@ -224,13 +237,78 @@
+ 	{ 4333, 9, RX_ENC_VHT, RX_ENC_FLAG_SHORT_GI, RATE_INFO_BW_80 },
+ };
+ 
++static struct sk_buff *wcn36xx_unchain_msdu(struct sk_buff_head *amsdu)
++{
++	struct sk_buff *skb, *first;
++	int total_len = 0;
++	int space;
++
++	first = __skb_dequeue(amsdu);
++
++	skb_queue_walk(amsdu, skb)
++		total_len += skb->len;
++
++	space = total_len - skb_tailroom(first);
++	if (space > 0 && pskb_expand_head(first, 0, space, GFP_ATOMIC) < 0) {
++		__skb_queue_head(amsdu, first);
++		return NULL;
++	}
++
++	/* Walk list again, copying contents into msdu_head */
++	while ((skb = __skb_dequeue(amsdu))) {
++		skb_copy_from_linear_data(skb, skb_put(first, skb->len),
++					  skb->len);
++		dev_kfree_skb_irq(skb);
++	}
++
++	return first;
++}
++
++static void __skb_queue_purge_irq(struct sk_buff_head *list)
++{
++	struct sk_buff *skb;
++
++	while ((skb = __skb_dequeue(list)) != NULL)
++		dev_kfree_skb_irq(skb);
++}
++
++static void wcn36xx_update_survey(struct wcn36xx *wcn, int rssi, int snr,
++				  int band, int freq)
++{
++	static struct ieee80211_channel *channel;
++	struct ieee80211_supported_band *sband;
++	int idx;
++	int i;
++	u8 snr_sample = snr & 0xff;
++
++	idx = 0;
++	if (band == NL80211_BAND_5GHZ)
++		idx = wcn->hw->wiphy->bands[NL80211_BAND_2GHZ]->n_channels;
++
++	sband = wcn->hw->wiphy->bands[band];
++	channel = sband->channels;
++
++	for (i = 0; i < sband->n_channels; i++, channel++) {
++		if (channel->center_freq == freq) {
++			idx += i;
++			break;
++		}
++	}
++
++	spin_lock(&wcn->survey_lock);
++	wcn->chan_survey[idx].rssi = rssi;
++	wcn->chan_survey[idx].snr = snr;
++	spin_unlock(&wcn->survey_lock);
++
++	add_device_randomness(&snr_sample, sizeof(snr_sample));
++}
++
+ int wcn36xx_rx_skb(struct wcn36xx *wcn, struct sk_buff *skb)
+ {
+ 	struct ieee80211_rx_status status;
+ 	const struct wcn36xx_rate *rate;
+ 	struct ieee80211_hdr *hdr;
+ 	struct wcn36xx_rx_bd *bd;
+-	struct ieee80211_supported_band *sband;
+ 	u16 fc, sn;
+ 
+ 	/*
+@@ -245,6 +323,26 @@
+ 			 "BD   <<< ", (char *)bd,
+ 			 sizeof(struct wcn36xx_rx_bd));
+ 
++	if (bd->pdu.mpdu_data_off <= bd->pdu.mpdu_header_off ||
++	    bd->pdu.mpdu_len < bd->pdu.mpdu_header_len)
++		goto drop;
++
++	if (bd->asf && !bd->esf) { /* chained A-MSDU chunks */
++		/* Sanity check */
++		if (bd->pdu.mpdu_data_off + bd->pdu.mpdu_len > WCN36XX_PKT_SIZE)
++			goto drop;
++
++		skb_put(skb, bd->pdu.mpdu_data_off + bd->pdu.mpdu_len);
++		skb_pull(skb, bd->pdu.mpdu_data_off);
++
++		/* Only set status for first chained BD (with mac header) */
++		goto done;
++	}
++
++	if (bd->pdu.mpdu_header_off < sizeof(*bd) ||
++	    bd->pdu.mpdu_header_off + bd->pdu.mpdu_len > WCN36XX_PKT_SIZE)
++		goto drop;
++
+ 	skb_put(skb, bd->pdu.mpdu_header_off + bd->pdu.mpdu_len);
+ 	skb_pull(skb, bd->pdu.mpdu_header_off);
+ 
+@@ -252,8 +350,6 @@
+ 	fc = __le16_to_cpu(hdr->frame_control);
+ 	sn = IEEE80211_SEQ_TO_SN(__le16_to_cpu(hdr->seq_ctrl));
+ 
+-	status.freq = WCN36XX_CENTER_FREQ(wcn);
+-	status.band = WCN36XX_BAND(wcn);
+ 	status.mactime = 10;
+ 	status.signal = -get_rssi0(bd);
+ 	status.antenna = 1;
+@@ -265,18 +361,39 @@
+ 
+ 	wcn36xx_dbg(WCN36XX_DBG_RX, "status.flags=%x\n", status.flag);
+ 
++	if (bd->scan_learn) {
++		/* If packet originate from hardware scanning, extract the
++		 * band/channel from bd descriptor.
++		 */
++		u8 hwch = (bd->reserved0 << 4) + bd->rx_ch;
++
++		if (bd->rf_band != 1 && hwch <= sizeof(ab_rx_ch_map) && hwch >= 1) {
++			status.band = NL80211_BAND_5GHZ;
++			status.freq = ieee80211_channel_to_frequency(ab_rx_ch_map[hwch - 1],
++								     status.band);
++		} else {
++			status.band = NL80211_BAND_2GHZ;
++			status.freq = ieee80211_channel_to_frequency(hwch, status.band);
++		}
++	} else {
++		status.band = WCN36XX_BAND(wcn);
++		status.freq = WCN36XX_CENTER_FREQ(wcn);
++	}
++
++	wcn36xx_update_survey(wcn, status.signal, get_snr(bd),
++			      status.band, status.freq);
++
+ 	if (bd->rate_id < ARRAY_SIZE(wcn36xx_rate_table)) {
+ 		rate = &wcn36xx_rate_table[bd->rate_id];
+ 		status.encoding = rate->encoding;
+ 		status.enc_flags = rate->encoding_flags;
+ 		status.bw = rate->bw;
+ 		status.rate_idx = rate->mcs_or_legacy_index;
+-		sband = wcn->hw->wiphy->bands[status.band];
+ 		status.nss = 1;
+ 
+ 		if (status.band == NL80211_BAND_5GHZ &&
+ 		    status.encoding == RX_ENC_LEGACY &&
+-		    status.rate_idx >= sband->n_bitrates) {
++		    status.rate_idx >= 4) {
+ 			/* no dsss rates in 5Ghz rates table */
+ 			status.rate_idx -= 4;
+ 		}
+@@ -287,6 +404,10 @@
+ 		status.rate_idx = 0;
+ 	}
+ 
++	if (ieee80211_is_beacon(hdr->frame_control) ||
++	    ieee80211_is_probe_resp(hdr->frame_control))
++		status.boottime_ns = ktime_get_boottime_ns();
++
+ 	memcpy(IEEE80211_SKB_RXCB(skb), &status, sizeof(status));
+ 
+ 	if (ieee80211_is_beacon(hdr->frame_control)) {
+@@ -301,9 +422,37 @@
+ 				 (char *)skb->data, skb->len);
+ 	}
+ 
++done:
++	/*  Chained AMSDU ? slow path */
++	if (unlikely(bd->asf && !(bd->lsf && bd->esf))) {
++		if (bd->esf && !skb_queue_empty(&wcn->amsdu)) {
++			wcn36xx_err("Discarding non complete chain");
++			__skb_queue_purge_irq(&wcn->amsdu);
++		}
++
++		__skb_queue_tail(&wcn->amsdu, skb);
++
++		if (!bd->lsf)
++			return 0; /* Not the last AMSDU, wait for more */
++
++		skb = wcn36xx_unchain_msdu(&wcn->amsdu);
++		if (!skb)
++			goto drop;
++	}
++
+ 	ieee80211_rx_irqsafe(wcn->hw, skb);
+ 
+ 	return 0;
++
++drop: /* drop everything */
++	wcn36xx_err("Drop frame! skb:%p len:%u hoff:%u doff:%u asf=%u esf=%u lsf=%u\n",
++		    skb, bd->pdu.mpdu_len, bd->pdu.mpdu_header_off,
++		    bd->pdu.mpdu_data_off, bd->asf, bd->esf, bd->lsf);
++
++	dev_kfree_skb_irq(skb);
++	__skb_queue_purge_irq(&wcn->amsdu);
++
++	return -EINVAL;
+ }
+ 
+ static void wcn36xx_set_tx_pdu(struct wcn36xx_tx_bd *bd,
+@@ -317,8 +466,6 @@
+ 		bd->pdu.mpdu_header_off;
+ 	bd->pdu.mpdu_len = len;
+ 	bd->pdu.tid = tid;
+-	/* Use seq number generated by mac80211 */
+-	bd->pdu.bd_ssn = WCN36XX_TXBD_SSN_FILL_HOST;
+ }
+ 
+ static inline struct wcn36xx_vif *get_vif_by_addr(struct wcn36xx *wcn,
+@@ -415,6 +562,9 @@
+ 		tid = ieee80211_get_tid(hdr);
+ 		/* TID->QID is one-to-one mapping */
+ 		bd->queue_id = tid;
++		bd->pdu.bd_ssn = WCN36XX_TXBD_SSN_FILL_DPU_QOS;
++	} else {
++		bd->pdu.bd_ssn = WCN36XX_TXBD_SSN_FILL_DPU_NON_QOS;
+ 	}
+ 
+ 	if (info->flags & IEEE80211_TX_INTFL_DONT_ENCRYPT ||
+@@ -425,6 +575,9 @@
+ 	if (ieee80211_is_any_nullfunc(hdr->frame_control)) {
+ 		/* Don't use a regular queue for null packet (no ampdu) */
+ 		bd->queue_id = WCN36XX_TX_U_WQ_ID;
++		bd->bd_rate = WCN36XX_BD_RATE_CTRL;
++		if (ieee80211_is_qos_nullfunc(hdr->frame_control))
++			bd->pdu.bd_ssn = WCN36XX_TXBD_SSN_FILL_HOST;
+ 	}
+ 
+ 	if (bcast) {
+@@ -484,6 +637,8 @@
+ 		bd->queue_id = WCN36XX_TX_U_WQ_ID;
+ 	*vif_priv = __vif_priv;
+ 
++	bd->pdu.bd_ssn = WCN36XX_TXBD_SSN_FILL_DPU_NON_QOS;
++
+ 	wcn36xx_set_tx_pdu(bd,
+ 			   ieee80211_is_data_qos(hdr->frame_control) ?
+ 			   sizeof(struct ieee80211_qos_hdr) :
+@@ -498,10 +653,11 @@
+ 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+ 	struct wcn36xx_vif *vif_priv = NULL;
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+-	unsigned long flags;
+ 	bool is_low = ieee80211_is_data(hdr->frame_control);
+ 	bool bcast = is_broadcast_ether_addr(hdr->addr1) ||
+ 		is_multicast_ether_addr(hdr->addr1);
++	bool ack_ind = (info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS) &&
++					!(info->flags & IEEE80211_TX_CTL_NO_ACK);
+ 	struct wcn36xx_tx_bd bd;
+ 	int ret;
+ 
+@@ -517,30 +673,16 @@
+ 
+ 	bd.dpu_rf = WCN36XX_BMU_WQ_TX;
+ 
+-	if (info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS) {
++	if (unlikely(ack_ind)) {
+ 		wcn36xx_dbg(WCN36XX_DBG_DXE, "TX_ACK status requested\n");
+ 
+-		spin_lock_irqsave(&wcn->dxe_lock, flags);
+-		if (wcn->tx_ack_skb) {
+-			spin_unlock_irqrestore(&wcn->dxe_lock, flags);
+-			wcn36xx_warn("tx_ack_skb already set\n");
+-			return -EINVAL;
+-		}
+-
+-		wcn->tx_ack_skb = skb;
+-		spin_unlock_irqrestore(&wcn->dxe_lock, flags);
+-
+ 		/* Only one at a time is supported by fw. Stop the TX queues
+ 		 * until the ack status gets back.
+ 		 */
+ 		ieee80211_stop_queues(wcn->hw);
+ 
+-		/* TX watchdog if no TX irq or ack indication received  */
+-		mod_timer(&wcn->tx_ack_timer, jiffies + HZ / 10);
+-
+ 		/* Request ack indication from the firmware */
+-		if (!(info->flags & IEEE80211_TX_CTL_NO_ACK))
+-			bd.tx_comp = 1;
++		bd.tx_comp = 1;
+ 	}
+ 
+ 	/* Data frames served first*/
+@@ -554,16 +696,39 @@
+ 	bd.tx_bd_sign = 0xbdbdbdbd;
+ 
+ 	ret = wcn36xx_dxe_tx_frame(wcn, vif_priv, &bd, skb, is_low);
+-	if (ret && (info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS)) {
+-		/* If the skb has not been transmitted,
+-		 * don't keep a reference to it.
+-		 */
+-		spin_lock_irqsave(&wcn->dxe_lock, flags);
+-		wcn->tx_ack_skb = NULL;
+-		spin_unlock_irqrestore(&wcn->dxe_lock, flags);
+-
++	if (unlikely(ret && ack_ind)) {
++		/* If the skb has not been transmitted, resume TX queue */
+ 		ieee80211_wake_queues(wcn->hw);
+ 	}
+ 
+ 	return ret;
+ }
++
++void wcn36xx_process_tx_rate(struct ani_global_class_a_stats_info *stats, struct rate_info *info)
++{
++	/* tx_rate is in units of 500kbps; mac80211 wants them in 100kbps */
++	if (stats->tx_rate_flags & HAL_TX_RATE_LEGACY)
++		info->legacy = stats->tx_rate * 5;
++
++	info->flags = 0;
++	info->mcs = stats->mcs_index;
++	info->nss = 1;
++
++	if (stats->tx_rate_flags & (HAL_TX_RATE_HT20 | HAL_TX_RATE_HT40))
++		info->flags |= RATE_INFO_FLAGS_MCS;
++
++	if (stats->tx_rate_flags & (HAL_TX_RATE_VHT20 | HAL_TX_RATE_VHT40 | HAL_TX_RATE_VHT80))
++		info->flags |= RATE_INFO_FLAGS_VHT_MCS;
++
++	if (stats->tx_rate_flags & HAL_TX_RATE_SGI)
++		info->flags |= RATE_INFO_FLAGS_SHORT_GI;
++
++	if (stats->tx_rate_flags & (HAL_TX_RATE_HT20 | HAL_TX_RATE_VHT20))
++		info->bw = RATE_INFO_BW_20;
++
++	if (stats->tx_rate_flags & (HAL_TX_RATE_HT40 | HAL_TX_RATE_VHT40))
++		info->bw = RATE_INFO_BW_40;
++
++	if (stats->tx_rate_flags & HAL_TX_RATE_VHT80)
++		info->bw = RATE_INFO_BW_80;
++}
+diff -Nur ./wcn36xx/txrx.h ./wcn36xx_new/txrx.h
+--- ./wcn36xx/txrx.h	2022-12-05 20:37:37.244174400 +0800
++++ ./wcn36xx_new/txrx.h	2022-12-05 20:37:04.072543300 +0800
+@@ -110,7 +110,8 @@
+ 	/* 0x44 */
+ 	u32	exp_seq_num:12;
+ 	u32	cur_seq_num:12;
+-	u32	fr_type_subtype:8;
++	u32	rf_band:2;
++	u32	fr_type_subtype:6;
+ 
+ 	/* 0x48 */
+ 	u32	msdu_size:16;
+@@ -163,5 +164,6 @@
+ int wcn36xx_start_tx(struct wcn36xx *wcn,
+ 		     struct wcn36xx_sta *sta_priv,
+ 		     struct sk_buff *skb);
++void wcn36xx_process_tx_rate(struct ani_global_class_a_stats_info *stats, struct rate_info *info);
+ 
+ #endif	/* _TXRX_H_ */
+diff -Nur ./wcn36xx/wcn36xx.h ./wcn36xx_new/wcn36xx.h
+--- ./wcn36xx/wcn36xx.h	2022-12-05 20:37:37.173212900 +0800
++++ ./wcn36xx_new/wcn36xx.h	2022-12-05 20:37:04.016299500 +0800
+@@ -18,6 +18,7 @@
+ #define _WCN36XX_H_
+ 
+ #include <linux/completion.h>
++#include <linux/in6.h>
+ #include <linux/printk.h>
+ #include <linux/spinlock.h>
+ #include <net/mac80211.h>
+@@ -96,6 +97,7 @@
+ 
+ #define RF_UNKNOWN	0x0000
+ #define RF_IRIS_WCN3620	0x3620
++#define RF_IRIS_WCN3660	0x3660
+ #define RF_IRIS_WCN3680	0x3680
+ 
+ static inline void buff_to_be(u32 *buf, size_t len)
+@@ -127,7 +129,6 @@
+ 	enum wcn36xx_hal_bss_type bss_type;
+ 
+ 	/* Power management */
+-	bool allow_bmps;
+ 	enum wcn36xx_power_state pw_state;
+ 
+ 	u8 bss_index;
+@@ -136,7 +137,22 @@
+ 	u8 self_dpu_desc_index;
+ 	u8 self_ucast_dpu_sign;
+ 
++#if IS_ENABLED(CONFIG_IPV6)
++	/* IPv6 addresses for WoWLAN */
++	struct in6_addr target_ipv6_addrs[WCN36XX_HAL_IPV6_OFFLOAD_ADDR_MAX];
++	unsigned long tentative_addrs[BITS_TO_LONGS(WCN36XX_HAL_IPV6_OFFLOAD_ADDR_MAX)];
++	int num_target_ipv6_addrs;
++#endif
++	/* WoWLAN GTK rekey data */
++	struct {
++		u8 kck[NL80211_KCK_LEN], kek[NL80211_KEK_LEN];
++		__le64 replay_ctr;
++		bool valid;
++	} rekey_data;
++
+ 	struct list_head sta_list;
++
++	int bmps_fail_ct;
+ };
+ 
+ /**
+@@ -179,12 +195,20 @@
+ 	enum wcn36xx_ampdu_state ampdu_state[16];
+ 	int non_agg_frame_ct;
+ };
++
+ struct wcn36xx_dxe_ch;
++
++struct wcn36xx_chan_survey {
++	s8	rssi;
++	u8	snr;
++};
++
+ struct wcn36xx {
+ 	struct ieee80211_hw	*hw;
+ 	struct device		*dev;
+ 	struct list_head	vif_list;
+ 
++	const char		*nv_file;
+ 	const struct firmware	*nv;
+ 
+ 	u8			fw_revision;
+@@ -232,6 +256,8 @@
+ 	struct cfg80211_scan_request *scan_req;
+ 	bool			sw_scan;
+ 	u8			sw_scan_opchannel;
++	bool			sw_scan_init;
++	u8			sw_scan_channel;
+ 	struct ieee80211_vif	*sw_scan_vif;
+ 	struct mutex		scan_lock;
+ 	bool			scan_aborted;
+@@ -253,6 +279,9 @@
+ 	struct sk_buff		*tx_ack_skb;
+ 	struct timer_list	tx_ack_timer;
+ 
++	/* For A-MSDU re-aggregation */
++	struct sk_buff_head amsdu;
++
+ 	/* RF module */
+ 	unsigned		rf_id;
+ 
+@@ -261,6 +290,11 @@
+ 	struct wcn36xx_dfs_entry    dfs;
+ #endif /* CONFIG_WCN36XX_DEBUGFS */
+ 
++	struct ieee80211_supported_band *band;
++	struct ieee80211_channel *channel;
++
++	spinlock_t survey_lock;		/* protects chan_survey */
++	struct wcn36xx_chan_survey	*chan_survey;
+ };
+ 
+ static inline bool wcn36xx_is_fw_version(struct wcn36xx *wcn,
