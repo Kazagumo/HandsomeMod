@@ -3812,7 +3812,7 @@ diff -Nur a/drivers/remoteproc/qcom_wcnss.h b/drivers/remoteproc/qcom_wcnss.h
 -
  #endif
 diff -Nur a/drivers/remoteproc/qcom_wcnss_iris.c b/drivers/remoteproc/qcom_wcnss_iris.c
---- a/drivers/remoteproc/qcom_wcnss_iris.c	2022-12-07 16:00:56.088070300 +0800
+--- a/drivers/remoteproc/qcom_wcnss_iris.c	2022-12-07 19:57:11.836525200 +0800
 +++ b/drivers/remoteproc/qcom_wcnss_iris.c	2022-12-07 16:01:16.503968900 +0800
 @@ -17,7 +17,7 @@
  #include "qcom_wcnss.h"
@@ -3846,7 +3846,7 @@ diff -Nur a/drivers/remoteproc/qcom_wcnss_iris.c b/drivers/remoteproc/qcom_wcnss
 +};
 +
 +static void qcom_iris_release(struct device *dev)
-+{
+ {
 +	struct qcom_iris *iris = container_of(dev, struct qcom_iris, dev);
 +
 +	of_node_put(iris->dev.of_node);
@@ -3854,7 +3854,7 @@ diff -Nur a/drivers/remoteproc/qcom_wcnss_iris.c b/drivers/remoteproc/qcom_wcnss
 +}
 +
 +struct qcom_iris *qcom_iris_probe(struct device *parent, bool *use_48mhz_xo)
- {
++{
 +	const struct of_device_id *match;
  	const struct iris_data *data;
 -	struct qcom_wcnss *wcnss;
@@ -3940,7 +3940,7 @@ diff -Nur a/drivers/remoteproc/qcom_wcnss_iris.c b/drivers/remoteproc/qcom_wcnss
  	}
  
  	for (i = 0; i < iris->num_vregs; i++) {
-@@ -143,33 +190,17 @@
+@@ -143,34 +190,17 @@
  					   data->vregs[i].load_uA);
  	}
  
