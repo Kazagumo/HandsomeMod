@@ -96,16 +96,20 @@ define KernelPackage/qcom-remoteproc
   FILES:= \
          $(LINUX_DIR)/drivers/soc/qcom/mdt_loader.ko \
          $(LINUX_DIR)/drivers/soc/qcom/qmi_helpers.ko \
+	  $(LINUX_DIR)/drivers/rpmsg/qcom_smd.ko \
+	  $(LINUX_DIR)/drivers/soc/qcom/smem.ko \
          $(LINUX_DIR)/drivers/remoteproc/qcom_common.ko \
          $(LINUX_DIR)/drivers/remoteproc/qcom_pil_info.ko \
          $(LINUX_DIR)/drivers/remoteproc/qcom_sysmon.ko \
          $(LINUX_DIR)/drivers/rpmsg/qcom_glink.ko \
+	  $(LINUX_DIR)/drivers/rpmsg/rpmsg_core.ko \
          $(LINUX_DIR)/drivers/rpmsg/qcom_glink_smem.ko \
          $(LINUX_DIR)/drivers/misc/fastrpc.ko \
          $(LINUX_DIR)/net/qrtr/qrtr.ko \
          $(LINUX_DIR)/net/qrtr/ns.ko \
          $(LINUX_DIR)/net/qrtr/qrtr-smd.ko \
-         $(LINUX_DIR)/net/qrtr/qrtr-tun.ko
+         $(LINUX_DIR)/net/qrtr/qrtr-tun.ko \
+	  
   AUTOLOAD:=$(call AutoLoad,20,qcom_common qcom_pil_info qcom_sysmon mdt_loader qcom_memshare qrtr ns qrtr-smd qrtr-tun fastrpc qcom_glink qcom_glink_smem qmi_helpers)
   ifneq ($(wildcard $(LINUX_DIR)/drivers/soc/qcom/pdr_interface.ko),)
          FILES += $(LINUX_DIR)/drivers/soc/qcom/pdr_interface.ko
@@ -131,7 +135,7 @@ define KernelPackage/qcom-modem
          CONFIG_QCOM_IPA=n
   FILES:= \
          $(LINUX_DIR)/drivers/net/ethernet/qualcomm/rmnet/rmnet.ko \
-         $(LINUX_DIR)/drivers/net/ethernet/qualcomm/bam-dmux.ko \
+         $(LINUX_DIR)/drivers/net/wwan/qcom_bam_dmux.ko \
          $(LINUX_DIR)/drivers/remoteproc/qcom_q6v5.ko \
          $(LINUX_DIR)/drivers/remoteproc/qcom_q6v5_mss.ko
   AUTOLOAD:=$(call AutoLoad,50,rmnet bam-dmux qcom_q6v5 qcom_q6v5_mss)
